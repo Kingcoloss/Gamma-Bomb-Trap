@@ -375,15 +375,40 @@ def fetch_github_history(file_path, max_commits=200):
     return pd.DataFrame()
 
 
+@st.cache_data(show_spinner=False, ttl=50)
+def get_latest_commit_sha(file_path: str) -> str | None:
+    """
+    Lightweight GitHub check: fetch only the latest commit SHA for a file.
+    Used by auto-refresh to detect new data without downloading content.
+    TTL=50s ensures the cache expires before the 60-second refresh cycle.
+    """
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    if GITHUB_TOKEN.strip():
+        headers['Authorization'] = f'token {GITHUB_TOKEN.strip()}'
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{REPO}/commits?path={file_path}&per_page=1",
+            headers=headers, timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return data[0]['sha']
+    except Exception:
+        pass
+    return None
+
+
 # ==========================================
 # ─── Session State ───
 # ==========================================
-if 'is_playing' not in st.session_state:
-    st.session_state.is_playing = False
-if 'anim_idx' not in st.session_state:
-    st.session_state.anim_idx = 0
-if 'focus_slider' not in st.session_state:
-    st.session_state.focus_slider = False
+if 'is_playing'    not in st.session_state: st.session_state.is_playing    = False
+if 'anim_idx'      not in st.session_state: st.session_state.anim_idx      = 0
+if 'focus_slider'  not in st.session_state: st.session_state.focus_slider  = False
+if 'fetch_mode'    not in st.session_state: st.session_state.fetch_mode    = "📋 Manual"
+if 'last_auto_check' not in st.session_state: st.session_state.last_auto_check = 0.0
+if 'sha_intra'     not in st.session_state: st.session_state.sha_intra     = None
+if 'sha_oi'        not in st.session_state: st.session_state.sha_oi        = None
 
 if 'my_intraday_data' not in st.session_state:
     raw_intra = fetch_github_history("IntradayData.txt", max_commits=200)
@@ -394,7 +419,7 @@ if 'my_intraday_data' not in st.session_state:
 # ==========================================
 # ─── Top Controls ───
 # ==========================================
-col_spin, col_dropdown, col_refresh = st.columns([7, 2, 1.5])
+col_spin, col_mode, col_dropdown, col_refresh = st.columns([5.5, 2, 2, 1.5])
 
 with col_dropdown:
     chart_mode = st.selectbox(
@@ -402,6 +427,16 @@ with col_dropdown:
         ["Call / Put Vol", "Total Vol"],
         label_visibility="collapsed",
     )
+
+with col_mode:
+    fetch_mode = st.selectbox(
+        "Fetch Mode",
+        ["📋 Manual", "🔄 Auto (1 min)"],
+        index=["📋 Manual", "🔄 Auto (1 min)"].index(st.session_state.fetch_mode),
+        label_visibility="collapsed",
+        key="fetch_mode_select",
+    )
+    st.session_state.fetch_mode = fetch_mode
 
 with col_spin:
     status_placeholder = st.empty()
@@ -413,7 +448,13 @@ with col_spin:
         status_placeholder.caption(f"⏱  ข้อมูลล่าสุดเวลา **{last_fetch}** น.")
 
 with col_refresh:
-    if st.button(":material/refresh: Refresh Data", use_container_width=True):
+    refresh_disabled = (fetch_mode == "🔄 Auto (1 min)")
+    if st.button(
+        ":material/refresh: Refresh",
+        use_container_width=True,
+        disabled=refresh_disabled,
+        help="ปิดใช้งานเมื่อเปิด Auto Refresh" if refresh_disabled else "โหลดข้อมูลใหม่จาก GitHub",
+    ):
         start_time = time.time()
         with status_placeholder:
             with st.spinner("กำลังเชื่อมต่อข้อมูล..."):
@@ -427,7 +468,8 @@ with col_refresh:
 
         if 'selected_time_state' in st.session_state:
             del st.session_state['selected_time_state']
-        st.session_state.is_playing = False
+        st.session_state.is_playing  = False
+        st.session_state.last_auto_check = 0.0   # reset timer after manual refresh
         st.rerun()
 
 
@@ -517,6 +559,138 @@ def _add_atm_vline(fig, atm):
         opacity=0.8,
         annotation_text="ATM",
         annotation_position="top",
+    )
+
+
+# ==========================================
+# ─── Thai Hover-Tooltip Legend ───
+# ==========================================
+#
+# คำอธิบายเส้นในกราฟ (ภาษาไทย สำหรับผู้เริ่มต้น)
+# Hover over each badge below the chart to read the explanation.
+# ==========================================
+
+_THAI_LINE_INFO = {
+    "ATM": {
+        "color": "#888888",
+        "title": "เส้น ATM (At-The-Money)",
+        "desc": (
+            "ATM คือ <b>ราคาซื้อขายปัจจุบันของ Gold Futures</b> (ดึงจาก Header ข้อมูล CME) "
+            "ทุก Greek ถูกคำนวณโดยอิงกับราคานี้<br><br>"
+            "• ราคาอยู่ <b>เหนือ ATM</b> → ตลาดอยู่ฝั่ง Bullish<br>"
+            "• ราคาอยู่ <b>ต่ำกว่า ATM</b> → ตลาดอยู่ฝั่ง Bearish<br><br>"
+            "<i>เส้นนี้ไม่ได้มาจากการคำนวณ — อ่านตรงจาก CME data feed</i>"
+        ),
+    },
+    "GEX Flip": {
+        "color": "#A855F7",
+        "title": "จุด GEX Flip — เปลี่ยนระบอบตลาด",
+        "desc": (
+            "<b>Gamma Exposure (GEX)</b> คือผลรวม Gamma ของ Dealers คูณ Open Interest ในแต่ละ Strike "
+            "คำนวณด้วย <b>Black-76 Model</b> (เหมาะกับ Options on Futures)<br><br>"
+            "GEX Flip คือ <b>จุดที่ Cumulative Net GEX เปลี่ยนจากบวกเป็นลบ</b><br><br>"
+            "• เหนือ GEX Flip → Dealers <b>Long Gamma</b> → ตลาดมักดีดกลับ (Mean-Revert)<br>"
+            "• ต่ำกว่า GEX Flip → Dealers <b>Short Gamma</b> → ตลาดอาจเคลื่อนรุนแรง (Trending)<br><br>"
+            "<i>สูตร: Net GEX_K = Γ_B76(F,K,T,σ) × (Call_OI − Put_OI) × F² × 0.01</i>"
+        ),
+    },
+    "+GEX Wall": {
+        "color": "#22C55E",
+        "title": "กำแพง Gamma บวก (+GEX Wall) — แนวต้านตาม Gamma",
+        "desc": (
+            "Strike ที่มีค่า <b>Positive Net GEX สูงสุด</b> — เกิดจาก Call Open Interest ที่หนาแน่น<br><br>"
+            "เมื่อ Futures เข้าใกล้ระดับนี้ Dealers ต้อง <b>ซื้อ Futures กลับ (Buy to Hedge)</b> "
+            "เพื่อ Delta Hedge Call ที่ขายออกไป → แรงซื้อนี้ทำให้ราคามักชะลอหรือดีดกลับ<br><br>"
+            "• ใช้เป็น <b>แนวต้านที่อิงจาก Gamma</b> (Gamma Resistance Zone)<br>"
+            "• ยิ่ง OI หนามาก แรงต้านยิ่งแกร่ง"
+        ),
+    },
+    "-GEX Wall": {
+        "color": "#F43F5E",
+        "title": "กำแพง Gamma ลบ (−GEX Wall) — แนวรับตาม Gamma",
+        "desc": (
+            "Strike ที่มีค่า <b>Negative Net GEX สูงสุด</b> — เกิดจาก Put Open Interest ที่หนาแน่น<br><br>"
+            "เมื่อ Futures เข้าใกล้ระดับนี้ Dealers ต้อง <b>ขาย Futures (Sell to Hedge)</b> "
+            "เพื่อ Delta Hedge Put ที่ขายออกไป → แรงขายนี้ทำให้ราคามักชะลอหรือดีดขึ้น<br><br>"
+            "• ใช้เป็น <b>แนวรับที่อิงจาก Gamma</b> (Gamma Support Zone)<br>"
+            "• ถ้าราคาหลุด −GEX Wall แรงขาย Dealer จะเพิ่มขึ้น → Sell-off รุนแรงได้"
+        ),
+    },
+    "γ/θ Expiry": {
+        "color": "#FB923C",
+        "title": "ช่วง γ/θ Breakeven — ตลอดอายุ DTE ที่เหลือ",
+        "desc": (
+            "ช่วงราคาที่ <b>กำไรจาก Gamma ตลอด DTE ที่เหลือ = ต้นทุน Theta ทั้งหมด</b><br><br>"
+            "คำนวณจาก Black-76 ที่ ATM (r=0):<br>"
+            "<b>ΔF = F × σ × √(DTE / 365)</b><br><br>"
+            "• ราคาอยู่ <b>ภายในช่วงนี้</b> → Theta กินกำไร Gamma → Long Gamma ขาดทุน<br>"
+            "• ราคา <b>หลุดออกนอกช่วง</b> → Gamma ทำกำไรได้คุ้มกว่า Theta → Long Gamma กำไร<br><br>"
+            "<i>ยิ่ง DTE น้อย ช่วงนี้ยิ่งแคบ — เพราะ Theta สูงขึ้นมาก ใกล้ Expire</i>"
+        ),
+    },
+    "γ/θ Daily": {
+        "color": "#FCD34D",
+        "title": "ช่วง γ/θ Breakeven — รายวัน (1 Calendar Day)",
+        "desc": (
+            "ช่วงราคาที่ <b>กำไรจาก Gamma ต่อวัน = ต้นทุน Theta รายวัน</b><br><br>"
+            "คำนวณจาก Black-76 ที่ ATM:<br>"
+            "<b>ΔF = F × σ / √365</b><br><br>"
+            "• ใช้ประเมินว่า Futures ต้องเคลื่อนไหวขนาดไหน<b>ต่อวัน</b>เพื่อให้ Long Gamma มีกำไร<br>"
+            "• ถ้า Realized Move > Daily BE → Long Gamma ได้กำไรสุทธิในวันนั้น<br><br>"
+            "<i>ช่วง Daily BE ใหญ่กว่า Expiry BE เสมอ เมื่อ DTE &lt; 1 วัน</i>"
+        ),
+    },
+}
+
+_LEGEND_CSS = """
+<style>
+.vl-legend { display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 14px 0; }
+.vl-item {
+    position:relative; display:inline-flex; align-items:center; gap:7px;
+    padding:5px 11px 5px 9px; border-radius:7px; cursor:help;
+    font-size:12px; font-weight:500; white-space:nowrap;
+    background:rgba(255,255,255,0.04); border:1.5px solid;
+    transition:background 0.15s;
+}
+.vl-item:hover { background:rgba(255,255,255,0.10); }
+.vl-dot  { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+.vl-tip  {
+    display:none; position:absolute; bottom:118%; left:0;
+    width:310px; background:#12122a; color:#dde4ff;
+    padding:13px 15px; border-radius:10px; font-size:12px; line-height:1.65;
+    border:1px solid rgba(180,180,255,0.18);
+    box-shadow:0 8px 28px rgba(0,0,0,0.65); z-index:9999; pointer-events:none;
+    white-space:normal;
+}
+.vl-tip b { color:#ffffffcc; }
+.vl-tip i { color:#aaa; font-size:11px; }
+.vl-item:hover .vl-tip { display:block; }
+</style>
+"""
+
+def render_line_legend():
+    """
+    Render a compact hoverable legend row.
+    Each badge shows the line name; hovering reveals a Thai explanation.
+    """
+    badges = ""
+    for key, info in _THAI_LINE_INFO.items():
+        c = info["color"]
+        badges += (
+            f'<div class="vl-item" style="border-color:{c}">'
+            f'  <span class="vl-dot" style="background:{c}"></span>'
+            f'  <span style="color:{c}">{key}</span>'
+            f'  <div class="vl-tip">'
+            f'    <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:6px">'
+            f'      {info["title"]}'
+            f'    </div>'
+            f'    {info["desc"]}'
+            f'  </div>'
+            f'</div>'
+        )
+    st.markdown(
+        f'{_LEGEND_CSS}<div class="vl-legend">{badges}</div>',
+        unsafe_allow_html=True,
     )
 
 
@@ -640,6 +814,9 @@ if not df_intraday.empty:
         fig_intra.update_yaxes(title_text="Volume",     secondary_y=False, showgrid=True,  gridcolor='rgba(128,128,128,0.2)')
         fig_intra.update_yaxes(title_text="Volatility", secondary_y=True,  showgrid=False)
         st.plotly_chart(fig_intra, use_container_width=True)
+
+        # ── Hoverable Thai legend ──
+        render_line_legend()
 
         # ── GEX / Breakeven info row ──
         if gex_flip_i or lo_exp_i:
@@ -829,6 +1006,9 @@ if not df_intraday.empty:
             fig_oi.update_yaxes(title_text="Volatility",    secondary_y=True,  showgrid=False)
             st.plotly_chart(fig_oi, use_container_width=True)
 
+            # ── Hoverable Thai legend ──
+            render_line_legend()
+
             # ── GEX / Breakeven info row ──
             if gex_flip_o or lo_exp_o:
                 mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -867,6 +1047,60 @@ if not df_intraday.empty:
                 },
                 hide_index=True, use_container_width=True, height=800,
             )
+
+# ==========================================
+# ─── Auto-Refresh Engine ───
+# ==========================================
+# ตรวจสอบ GitHub ทุก 60 วินาที และโหลดข้อมูลใหม่เฉพาะเมื่อมีการเปลี่ยนแปลง
+# ==========================================
+if st.session_state.fetch_mode == "🔄 Auto (1 min)":
+    now      = time.time()
+    elapsed  = now - st.session_state.last_auto_check
+    wait_sec = max(0.0, 60.0 - elapsed)
+
+    # ── Update status bar to show countdown ──
+    if not df_intraday.empty:
+        last_fetch_t = df_intraday['Datetime'].max().strftime("%H:%M:%S")
+        if wait_sec > 0:
+            status_placeholder.caption(
+                f"⏱ ข้อมูลล่าสุด **{last_fetch_t}** น.  |  "
+                f"🔄 ตรวจสอบอัปเดตใน **{int(wait_sec)} วินาที**"
+            )
+        else:
+            status_placeholder.caption(
+                f"⏱ ข้อมูลล่าสุด **{last_fetch_t}** น.  |  🔄 กำลังตรวจสอบ..."
+            )
+
+    if wait_sec <= 0:
+        # ── Time to check GitHub for new commits ──
+        new_sha_intra = get_latest_commit_sha("IntradayData.txt")
+        new_sha_oi    = get_latest_commit_sha("OIData.txt")
+
+        data_changed = (
+            new_sha_intra != st.session_state.sha_intra
+            or new_sha_oi  != st.session_state.sha_oi
+        )
+
+        if data_changed:
+            # Clear data cache and reload fresh content
+            fetch_github_history.clear()
+            raw_i = fetch_github_history("IntradayData.txt", max_commits=200)
+            raw_o = fetch_github_history("OIData.txt",       max_commits=1)
+            st.session_state.my_intraday_data = filter_session_data(raw_i, "Intraday")
+            st.session_state.my_oi_data       = filter_session_data(raw_o, "OI")
+            if 'selected_time_state' in st.session_state:
+                del st.session_state['selected_time_state']
+
+        # Update tracking state
+        st.session_state.sha_intra       = new_sha_intra
+        st.session_state.sha_oi          = new_sha_oi
+        st.session_state.last_auto_check = time.time()
+        st.rerun()
+
+    else:
+        # ── Sleep in 5-second ticks so the countdown stays responsive ──
+        time.sleep(min(5.0, wait_sec))
+        st.rerun()
 
 else:
     st.info("รอข้อมูลอัปเดตตั้งแต่เวลา 10:00 น. เป็นต้นไป", icon=":material/lightbulb:")
