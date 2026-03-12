@@ -286,7 +286,7 @@ def filter_session_data(df, data_type):
     df_filtered = df_filtered.sort_values('Datetime').reset_index(drop=True)
     return df_filtered
 
-@st.cache_data(show_spinner=False, ttl=180)
+#@st.cache_data(show_spinner=False, ttl=180)
 def fetch_github_history(file_path, max_commits=200):
     headers = {'User-Agent': 'Mozilla/5.0'}
     if GITHUB_TOKEN.strip():
@@ -375,7 +375,7 @@ def fetch_github_history(file_path, max_commits=200):
     return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False, ttl=50)
+#@st.cache_data(show_spinner=False, ttl=50)
 def get_latest_commit_sha(file_path: str) -> str | None:
     """
     Lightweight GitHub check: fetch only the latest commit SHA for a file.
@@ -697,6 +697,7 @@ def render_line_legend():
 # ==========================================
 # ─── Main Content ───
 # ==========================================
+print(f"intraday data rows: {len(df_intraday)}, OI data rows: {len(df_oi)}")
 if not df_intraday.empty:
     available_times = df_intraday['Time'].unique()
 
