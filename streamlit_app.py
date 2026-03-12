@@ -1102,5 +1102,5 @@ if st.session_state.fetch_mode == "🔄 Auto (1 min)":
         time.sleep(min(5.0, wait_sec))
         st.rerun()
 
-else:
-    st.info("รอข้อมูลอัปเดตตั้งแต่เวลา 10:00 น. เป็นต้นไป", icon=":material/lightbulb:")
+# else:
+#     st.info("รอข้อมูลอัปเดตตั้งแต่เวลา 10:00 น. เป็นต้นไป", icon=":material/lightbulb:")
