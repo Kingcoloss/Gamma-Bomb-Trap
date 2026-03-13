@@ -162,23 +162,34 @@ def _normalize_iv(sigma_raw: float) -> float:
     return max(sigma, 0.0001)
 
 
-def calculate_gex_analysis(df, futures_price: float, dte: float):
+def calculate_gex_analysis(df, futures_price: float, dte: float,
+                           data_mode: str = "OI"):
     """
-    Compute per-strike Net Gamma Exposure (GEX) using the Black-76 model
+    Compute per-strike Net Gamma Exposure using the Black-76 model
     and identify key structural levels.
 
-    Model:  Net GEX_K = Γ_B76(F, K, T, σ_K) × (Call_OI_K − Put_OI_K) × F² × 0.01
+    Two semantically distinct modes (same math, different interpretation):
+
+      data_mode = "OI"   →  GEX (Gamma Exposure)
+        Uses Open Interest.  Measures *dealer positions*.
+        Net GEX_K = Γ_B76(F,K,T,σ_K) × (Call_OI − Put_OI) × F² × 0.01
+
+      data_mode = "Intraday"  →  γ-Flow (Gamma-weighted Volume Flow)
+        Uses Intraday Volume.  Measures *activity / order-flow*.
+        Net γ-Flow_K = Γ_B76(F,K,T,σ_K) × (Call_Vol − Put_Vol) × F² × 0.01
 
     Sign convention (dealer perspective):
-      +GEX → dealers are net long gamma  → price tends to mean-revert
-      −GEX → dealers are net short gamma → price can trend / become volatile
+      +value → stabilising (long gamma / mean-revert tendency)
+      −value → destabilising (short gamma / trending tendency)
 
     Returns
     -------
-    gex_flip : float   — strike where ΣNet_GEX crosses zero (regime change)
-    pos_wall : float   — strike of highest +GEX concentration (call resistance)
-    neg_wall : float   — strike of highest −GEX concentration (put support)
-    gex_df   : DataFrame — per-strike GEX and cumulative GEX
+    flip   : float | None — strike where cumulative net value crosses zero
+    pos_wall : float | None — strike of highest positive concentration
+    neg_wall : float | None — strike of highest negative concentration
+    gex_df : DataFrame     — per-strike detail (Strike, Call, Put, IV%,
+                              Gamma, Net_GEX, Cumulative_GEX)
+    peak   : float | None  — max |value| strike when no zero-crossing exists
     """
     T = max(dte / 365.0, 1e-6)
 
@@ -191,42 +202,49 @@ def calculate_gex_analysis(df, futures_price: float, dte: float):
 
         gamma   = _b76_gamma(futures_price, K, T, sigma)
         net_gex = gamma * (call - put) * (futures_price ** 2) * 0.01
-        gex_rows.append({'Strike': K, 'GEX': net_gex})
+        gex_rows.append({
+            'Strike': K,
+            'Call': call,
+            'Put': put,
+            'IV %': round(sigma * 100, 2),
+            'Gamma': gamma,
+            'Net_GEX': net_gex,
+        })
 
     gex_df = (
         pd.DataFrame(gex_rows)
         .sort_values('Strike')
         .reset_index(drop=True)
     )
-    gex_df['Cumulative_GEX'] = gex_df['GEX'].cumsum()
+    gex_df['Cumulative_GEX'] = gex_df['Net_GEX'].cumsum()
 
-    # ── GEX Flip: first zero-crossing of cumulative GEX ──
-    gex_flip = None
+    # ── Flip point: first zero-crossing of cumulative net value ──
+    flip = None
     for i in range(1, len(gex_df)):
         prev_cum = gex_df.loc[i - 1, 'Cumulative_GEX']
         curr_cum = gex_df.loc[i,     'Cumulative_GEX']
         if prev_cum * curr_cum <= 0:
             denom = abs(prev_cum) + abs(curr_cum)
             w = abs(prev_cum) / denom if denom > 0 else 0.5
-            gex_flip = (gex_df.loc[i - 1, 'Strike']
-                        + w * (gex_df.loc[i, 'Strike'] - gex_df.loc[i - 1, 'Strike']))
+            flip = (gex_df.loc[i - 1, 'Strike']
+                    + w * (gex_df.loc[i, 'Strike'] - gex_df.loc[i - 1, 'Strike']))
             break
 
-    # When no zero-crossing exists, gex_flip stays None.
-    # The caller should display "GEX Peak" (max |GEX| strike) instead.
-    gex_peak = gex_df.loc[gex_df['GEX'].abs().idxmax(), 'Strike'] if gex_flip is None else None
+    # When no zero-crossing exists, flip stays None.
+    # Return peak (max |value| strike) as a separate concept.
+    peak = gex_df.loc[gex_df['Net_GEX'].abs().idxmax(), 'Strike'] if flip is None else None
 
-    # ── GEX Walls ──
+    # ── Walls ──
     pos_wall = (
-        gex_df.loc[gex_df['GEX'].idxmax(), 'Strike']
-        if gex_df['GEX'].max() > 0 else None
+        gex_df.loc[gex_df['Net_GEX'].idxmax(), 'Strike']
+        if gex_df['Net_GEX'].max() > 0 else None
     )
     neg_wall = (
-        gex_df.loc[gex_df['GEX'].idxmin(), 'Strike']
-        if gex_df['GEX'].min() < 0 else None
+        gex_df.loc[gex_df['Net_GEX'].idxmin(), 'Strike']
+        if gex_df['Net_GEX'].min() < 0 else None
     )
 
-    return gex_flip, pos_wall, neg_wall, gex_df, gex_peak
+    return flip, pos_wall, neg_wall, gex_df, peak
 
 
 def get_atm_iv(df, futures_price: float) -> float | None:
@@ -243,17 +261,26 @@ def calculate_gamma_theta_breakeven(F: float, atm_iv: float, dte: float):
     """
     Black-76 Gamma-Theta Breakeven Range.
 
-    Derivation (Black-76, r = 0, at-the-money):
-      Theta_daily  = F · σ · N′(d1) / (2√T · 365)
-      Gamma        = N′(d1) / (F · σ · √T)
+    Reference: Silic & Poulsen (2021) eq. 27-28; Bossu et al. (2005).
 
-    Setting  |Theta_daily| = ½ · Γ · (ΔF)²  and solving:
-      (ΔF)²  = 2 · Theta_daily / Gamma
-             = 2 · [F · σ / (2√T · 365)] · [F · σ · √T]
-             = F² · σ² / 365
+    Derivation (Black-76, r = 0, at-the-money where d1 ≈ 0):
+      Theta (ATM) ≈ −½ · Γ · F² · σ²       [BS PDE, eq. 28 in thesis]
+      Gamma (ATM) =  N′(d1) / (F · σ · √T)
 
-      ΔF_daily  = F · σ / √365           (1-calendar-day breakeven)
-      ΔF_expiry = F · σ · √(DTE / 365)   (remaining-life breakeven)
+    The Daily P&L of a delta-hedged portfolio (eq. 27):
+      Daily P&L = ½ · Γ · (ΔF)² + Θ · Δt
+
+    Breakeven occurs when the gamma P&L offsets theta decay:
+      ½ · Γ · (ΔF)² = |Θ| · Δt = ½ · Γ · F² · σ² · Δt
+
+    Cancelling ½Γ on both sides:
+      (ΔF)² = F² · σ² · Δt
+
+    For 1 calendar day  (Δt = 1/365):
+      ΔF_daily  = F · σ / √365
+
+    For remaining life  (Δt = DTE/365):
+      ΔF_expiry = F · σ · √(DTE / 365)
 
     Returns
     -------
@@ -535,8 +562,12 @@ with col_refresh:
 # ==========================================
 # ─── Shared vline helper ───
 # ==========================================
-def _add_gex_vlines(fig, gex_flip, pos_wall, neg_wall):
-    """Add Gamma Exposure vertical lines to a Plotly figure."""
+def _add_gex_vlines(fig, gex_flip, pos_wall, neg_wall, label: str = "GEX"):
+    """Add Gamma structural vertical lines to a Plotly figure.
+
+    label : "GEX" for OI-based Gamma Exposure,
+            "γ-Flow" for volume-weighted Gamma Flow.
+    """
     if gex_flip is not None:
         fig.add_vline(
             x=gex_flip,
@@ -544,7 +575,7 @@ def _add_gex_vlines(fig, gex_flip, pos_wall, neg_wall):
             line_color="#A855F7",   # violet
             line_width=2,
             opacity=0.9,
-            annotation_text="GEX Flip",
+            annotation_text=f"{label} Flip",
             annotation_position="top right",
             annotation_font=dict(color="#A855F7", size=11),
         )
@@ -555,7 +586,7 @@ def _add_gex_vlines(fig, gex_flip, pos_wall, neg_wall):
             line_color="#22C55E",   # green
             line_width=1.5,
             opacity=0.7,
-            annotation_text="+GEX Wall",
+            annotation_text=f"+{label} Wall",
             annotation_position="top left",
             annotation_font=dict(color="#22C55E", size=10),
         )
@@ -566,7 +597,7 @@ def _add_gex_vlines(fig, gex_flip, pos_wall, neg_wall):
             line_color="#F43F5E",   # rose
             line_width=1.5,
             opacity=0.7,
-            annotation_text="-GEX Wall",
+            annotation_text=f"-{label} Wall",
             annotation_position="top right",
             annotation_font=dict(color="#F43F5E", size=10),
         )
@@ -803,13 +834,15 @@ if not df_intraday.empty:
             .sort_values('Strike')
         )
         gex_flip_i = pos_wall_i = neg_wall_i = gex_peak_i = None
+        gex_df_i = None
         lo_exp_i = hi_exp_i = lo_day_i = hi_day_i = None
+        iv_atm_i = None
 
         if atm_intra and dte_intra:
             iv_atm_i = get_atm_iv(frame_raw, atm_intra)
             if iv_atm_i and dte_intra > 0:
-                gex_flip_i, pos_wall_i, neg_wall_i, _, gex_peak_i = calculate_gex_analysis(
-                    frame_raw, atm_intra, dte_intra
+                gex_flip_i, pos_wall_i, neg_wall_i, gex_df_i, gex_peak_i = calculate_gex_analysis(
+                    frame_raw, atm_intra, dte_intra, data_mode="Intraday"
                 )
                 lo_exp_i, hi_exp_i, lo_day_i, hi_day_i = calculate_gamma_theta_breakeven(
                     atm_intra, iv_atm_i, dte_intra
@@ -861,12 +894,12 @@ if not df_intraday.empty:
             _add_atm_vline(fig_intra, atm_intra)
         if lo_exp_i and hi_exp_i:
             _add_theta_breakeven_vlines(fig_intra, lo_exp_i, hi_exp_i, lo_day_i, hi_day_i)
-        _add_gex_vlines(fig_intra, gex_flip_i, pos_wall_i, neg_wall_i)
+        _add_gex_vlines(fig_intra, gex_flip_i, pos_wall_i, neg_wall_i, label="γ-Flow")
         if gex_peak_i is not None:
             fig_intra.add_vline(
                 x=gex_peak_i, line_dash="dot", line_color="#C084FC",
                 line_width=1.5, opacity=0.7,
-                annotation_text="GEX Peak",
+                annotation_text="γ-Flow Peak",
                 annotation_position="top right",
                 annotation_font=dict(color="#C084FC", size=10),
             )
@@ -886,20 +919,22 @@ if not df_intraday.empty:
         # ── Hoverable Thai legend ──
         render_line_legend()
 
-        # ── GEX / Breakeven info row ──
+        # ── γ-Flow / Breakeven info row ──
+        # Note: Intraday tab uses Volume (not OI), so this is Gamma-weighted
+        # Volume Flow (γ-Flow), NOT Gamma Exposure (GEX).
         if gex_flip_i or gex_peak_i or lo_exp_i:
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             with mc1:
                 if gex_flip_i:
-                    st.metric("🟣 GEX Flip (B76)", f"{gex_flip_i:,.1f}")
+                    st.metric("🟣 γ-Flow Flip (B76)", f"{gex_flip_i:,.1f}")
                 elif gex_peak_i:
-                    st.metric("🟣 GEX Peak (B76)", f"{gex_peak_i:,.1f}")
+                    st.metric("🟣 γ-Flow Peak (B76)", f"{gex_peak_i:,.1f}")
             with mc2:
                 if pos_wall_i:
-                    st.metric("🟢 +GEX Wall", f"{pos_wall_i:,.0f}")
+                    st.metric("🟢 +γ-Flow Wall", f"{pos_wall_i:,.0f}")
             with mc3:
                 if neg_wall_i:
-                    st.metric("🔴 −GEX Wall", f"{neg_wall_i:,.0f}")
+                    st.metric("🔴 −γ-Flow Wall", f"{neg_wall_i:,.0f}")
             with mc4:
                 if lo_exp_i and hi_exp_i:
                     st.metric("🟠 γ/θ Expiry Range",
@@ -968,6 +1003,70 @@ if not df_intraday.empty:
             hide_index=True, use_container_width=True, height=800,
         )
 
+        # ── Gamma-weighted Volume Flow (γ-Flow) Table ──
+        # Note: This uses Intraday Volume, not OI — it measures where
+        # gamma-weighted *flow* is concentrated, not dealer *positions*.
+        if gex_df_i is not None and not gex_df_i.empty:
+            st.markdown("---")
+            st.markdown(
+                "### :material/ssid_chart: γ-Flow — Gamma-Weighted Volume Flow (Black-76)"
+            )
+            st.caption(
+                "⚠ ใช้ Intraday Volume (ไม่ใช่ Open Interest) — แสดง **Gamma × Volume Flow** "
+                "ไม่ใช่ Gamma Exposure (GEX) ที่ใช้ OI ของ Dealer"
+            )
+            gex_tbl_i = gex_df_i[['Strike', 'Call', 'Put', 'IV %', 'Gamma', 'Net_GEX', 'Cumulative_GEX']].copy()
+            gex_tbl_i = gex_tbl_i.rename(columns={
+                'Net_GEX': 'Net γ-Flow',
+                'Cumulative_GEX': 'Σ γ-Flow',
+            })
+            st.dataframe(
+                gex_tbl_i,
+                column_config={
+                    "Strike":      st.column_config.NumberColumn("Strike", format="%d"),
+                    "Call":        st.column_config.NumberColumn("Call Vol", format="%d"),
+                    "Put":         st.column_config.NumberColumn("Put Vol", format="%d"),
+                    "IV %":        st.column_config.NumberColumn("IV %", format="%.2f"),
+                    "Gamma":       st.column_config.NumberColumn("Γ (B76)", format="%.6e"),
+                    "Net γ-Flow":  st.column_config.NumberColumn("Net γ-Flow", format="%.2f"),
+                    "Σ γ-Flow":    st.column_config.NumberColumn("Σ γ-Flow", format="%.2f"),
+                },
+                hide_index=True, use_container_width=True, height=500,
+            )
+
+        # ── Gamma-Theta Breakeven Range Table ──
+        if atm_intra and dte_intra and iv_atm_i:
+            st.markdown("---")
+            st.markdown(
+                "### :material/balance: γ/θ Breakeven Range (Black-76)"
+            )
+            be_data_i = {
+                "Metric": [
+                    "Futures (ATM)",
+                    "ATM IV (σ)",
+                    "DTE",
+                    "T (years)",
+                    "γ/θ Daily ΔF = F·σ/√365",
+                    "γ/θ Daily Range",
+                    "γ/θ Expiry ΔF = F·σ·√T",
+                    "γ/θ Expiry Range",
+                ],
+                "Value": [
+                    f"{atm_intra:,.1f}",
+                    f"{iv_atm_i * 100:.2f} %",
+                    f"{dte_intra:.2f}",
+                    f"{dte_intra / 365:.6f}",
+                    f"± {atm_intra * iv_atm_i / math.sqrt(365):.1f}",
+                    f"{lo_day_i:,.1f} – {hi_day_i:,.1f}" if lo_day_i else "N/A",
+                    f"± {atm_intra * iv_atm_i * math.sqrt(dte_intra / 365):.1f}",
+                    f"{lo_exp_i:,.1f} – {hi_exp_i:,.1f}" if lo_exp_i else "N/A",
+                ],
+            }
+            st.dataframe(
+                pd.DataFrame(be_data_i),
+                hide_index=True, use_container_width=True,
+            )
+
         if st.session_state.is_playing:
             time.sleep(0.6)
             st.session_state.anim_idx += 1
@@ -1004,13 +1103,15 @@ if not df_intraday.empty:
                 .sort_values('Strike')
             )
             gex_flip_o = pos_wall_o = neg_wall_o = gex_peak_o = None
+            gex_df_o = None
             lo_exp_o = hi_exp_o = lo_day_o = hi_day_o = None
+            iv_atm_o = None
 
             if atm_oi and dte_oi:
                 iv_atm_o = get_atm_iv(oi_raw, atm_oi)
                 if iv_atm_o and dte_oi > 0:
-                    gex_flip_o, pos_wall_o, neg_wall_o, _, gex_peak_o = calculate_gex_analysis(
-                        oi_raw, atm_oi, dte_oi
+                    gex_flip_o, pos_wall_o, neg_wall_o, gex_df_o, gex_peak_o = calculate_gex_analysis(
+                        oi_raw, atm_oi, dte_oi, data_mode="OI"
                     )
                     lo_exp_o, hi_exp_o, lo_day_o, hi_day_o = calculate_gamma_theta_breakeven(
                         atm_oi, iv_atm_o, dte_oi
@@ -1113,20 +1214,83 @@ if not df_intraday.empty:
             st.markdown("---")
             st.markdown("### :material/analytics: OI Volume Data")
             table_df_oi = latest_oi[['Strike', 'Call', 'Put', 'Vol Settle']].copy()
-            table_df_oi['Total Vol'] = table_df_oi['Call'] + table_df_oi['Put']
-            table_df_oi = table_df_oi[['Strike', 'Call', 'Put', 'Total Vol', 'Vol Settle']]
+            table_df_oi['Total OI'] = table_df_oi['Call'] + table_df_oi['Put']
+            table_df_oi = table_df_oi[['Strike', 'Call', 'Put', 'Total OI', 'Vol Settle']]
 
             st.dataframe(
                 table_df_oi,
                 column_config={
                     "Strike":    st.column_config.NumberColumn("Strike Price", format="%d"),
-                    "Call":      st.column_config.ProgressColumn("Call Volume",  format="%d", min_value=0, max_value=int(table_df_oi['Call'].max())      if not table_df_oi.empty else 100),
-                    "Put":       st.column_config.ProgressColumn("Put Volume",   format="%d", min_value=0, max_value=int(table_df_oi['Put'].max())       if not table_df_oi.empty else 100),
-                    "Total Vol": st.column_config.ProgressColumn("Total Vol",    format="%d", min_value=0, max_value=int(table_df_oi['Total Vol'].max()) if not table_df_oi.empty else 100),
+                    "Call":      st.column_config.ProgressColumn("Call OI",  format="%d", min_value=0, max_value=int(table_df_oi['Call'].max())      if not table_df_oi.empty else 100),
+                    "Put":       st.column_config.ProgressColumn("Put OI",   format="%d", min_value=0, max_value=int(table_df_oi['Put'].max())       if not table_df_oi.empty else 100),
+                    "Total OI":  st.column_config.ProgressColumn("Total OI",    format="%d", min_value=0, max_value=int(table_df_oi['Total OI'].max()) if not table_df_oi.empty else 100),
                     "Vol Settle":st.column_config.NumberColumn("Vol Settle", format="%.2f"),
                 },
                 hide_index=True, use_container_width=True, height=800,
             )
+
+            # ── Gamma Exposure (GEX) Table ──
+            # This is the correct GEX: uses Open Interest (dealer positions).
+            if gex_df_o is not None and not gex_df_o.empty:
+                st.markdown("---")
+                st.markdown(
+                    "### :material/ssid_chart: GEX — Gamma Exposure per Strike (Black-76)"
+                )
+                st.caption(
+                    "ใช้ Open Interest (ตำแหน่ง Dealer) — แสดง **Net Gamma Exposure** "
+                    "ตามสูตร: Net GEX_K = Γ_B76(F,K,T,σ) × (Call_OI − Put_OI) × F² × 0.01"
+                )
+                gex_tbl_o = gex_df_o[['Strike', 'Call', 'Put', 'IV %', 'Gamma', 'Net_GEX', 'Cumulative_GEX']].copy()
+                gex_tbl_o = gex_tbl_o.rename(columns={
+                    'Net_GEX': 'Net GEX',
+                    'Cumulative_GEX': 'Σ GEX',
+                })
+                st.dataframe(
+                    gex_tbl_o,
+                    column_config={
+                        "Strike":   st.column_config.NumberColumn("Strike", format="%d"),
+                        "Call":     st.column_config.NumberColumn("Call OI", format="%d"),
+                        "Put":      st.column_config.NumberColumn("Put OI", format="%d"),
+                        "IV %":     st.column_config.NumberColumn("IV %", format="%.2f"),
+                        "Gamma":    st.column_config.NumberColumn("Γ (B76)", format="%.6e"),
+                        "Net GEX":  st.column_config.NumberColumn("Net GEX", format="%.2f"),
+                        "Σ GEX":    st.column_config.NumberColumn("Σ GEX", format="%.2f"),
+                    },
+                    hide_index=True, use_container_width=True, height=500,
+                )
+
+            # ── Gamma-Theta Breakeven Range Table ──
+            if atm_oi and dte_oi and iv_atm_o:
+                st.markdown("---")
+                st.markdown(
+                    "### :material/balance: γ/θ Breakeven Range (Black-76)"
+                )
+                be_data_o = {
+                    "Metric": [
+                        "Futures (ATM)",
+                        "ATM IV (σ)",
+                        "DTE",
+                        "T (years)",
+                        "γ/θ Daily ΔF = F·σ/√365",
+                        "γ/θ Daily Range",
+                        "γ/θ Expiry ΔF = F·σ·√T",
+                        "γ/θ Expiry Range",
+                    ],
+                    "Value": [
+                        f"{atm_oi:,.1f}",
+                        f"{iv_atm_o * 100:.2f} %",
+                        f"{dte_oi:.2f}",
+                        f"{dte_oi / 365:.6f}",
+                        f"± {atm_oi * iv_atm_o / math.sqrt(365):.1f}",
+                        f"{lo_day_o:,.1f} – {hi_day_o:,.1f}" if lo_day_o else "N/A",
+                        f"± {atm_oi * iv_atm_o * math.sqrt(dte_oi / 365):.1f}",
+                        f"{lo_exp_o:,.1f} – {hi_exp_o:,.1f}" if lo_exp_o else "N/A",
+                    ],
+                }
+                st.dataframe(
+                    pd.DataFrame(be_data_o),
+                    hide_index=True, use_container_width=True,
+                )
 
 # ==========================================
 # ─── Auto-Refresh Engine ───
