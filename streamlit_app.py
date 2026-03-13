@@ -1,3 +1,4 @@
+import json
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -19,7 +20,7 @@ import concurrent.futures
 # ดึง Token จาก Streamlit Secrets
 # ==========================================
 try:
-    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+    GITHUB_TOKEN = st.secrets["github"]["access_token"]
 except:
     GITHUB_TOKEN = ""
 # ==========================================
@@ -59,7 +60,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-REPO = "pageth/Vol2VolData"
+REPO = st.secrets["github"]["data_source_repo"]
 
 # ==========================================
 # Helper: extract ATM price from header
@@ -148,6 +149,19 @@ def _b76_gamma(F: float, K: float, T: float, sigma: float) -> float:
         return 0.0
 
 
+def _normalize_iv(sigma_raw: float) -> float:
+    """
+    Normalize implied volatility to decimal form.
+    CME Vol Settle may arrive as decimal (0.414) or percentage (41.4).
+    If sigma > 1.0 it is treated as percentage and divided by 100.
+    A minimum floor of 0.0001 prevents division-by-zero in Greeks.
+    """
+    sigma = float(sigma_raw)
+    if sigma > 1.0:
+        sigma /= 100.0
+    return max(sigma, 0.0001)
+
+
 def calculate_gex_analysis(df, futures_price: float, dte: float):
     """
     Compute per-strike Net Gamma Exposure (GEX) using the Black-76 model
@@ -171,7 +185,7 @@ def calculate_gex_analysis(df, futures_price: float, dte: float):
     gex_rows = []
     for _, row in df.iterrows():
         K     = float(row['Strike'])
-        sigma = max(float(row['Vol Settle']), 0.01)   # floor at 1% IV
+        sigma = _normalize_iv(row['Vol Settle'])
         call  = float(row['Call'])
         put   = float(row['Put'])
 
@@ -198,9 +212,9 @@ def calculate_gex_analysis(df, futures_price: float, dte: float):
                         + w * (gex_df.loc[i, 'Strike'] - gex_df.loc[i - 1, 'Strike']))
             break
 
-    if gex_flip is None:
-        # No zero-cross: fall back to strike of maximum |GEX|
-        gex_flip = gex_df.loc[gex_df['GEX'].abs().idxmax(), 'Strike']
+    # When no zero-crossing exists, gex_flip stays None.
+    # The caller should display "GEX Peak" (max |GEX| strike) instead.
+    gex_peak = gex_df.loc[gex_df['GEX'].abs().idxmax(), 'Strike'] if gex_flip is None else None
 
     # ── GEX Walls ──
     pos_wall = (
@@ -212,15 +226,17 @@ def calculate_gex_analysis(df, futures_price: float, dte: float):
         if gex_df['GEX'].min() < 0 else None
     )
 
-    return gex_flip, pos_wall, neg_wall, gex_df
+    return gex_flip, pos_wall, neg_wall, gex_df, gex_peak
 
 
 def get_atm_iv(df, futures_price: float) -> float | None:
-    """Return implied volatility (Vol Settle) at the strike nearest to the futures price."""
+    """Return implied volatility (Vol Settle, decimal) at the strike nearest to the futures price."""
     df_copy = df.copy()
     df_copy['_dist'] = (df_copy['Strike'] - futures_price).abs()
     closest = df_copy.nsmallest(1, '_dist')
-    return float(closest['Vol Settle'].iloc[0]) if not closest.empty else None
+    if closest.empty:
+        return None
+    return _normalize_iv(closest['Vol Settle'].iloc[0])
 
 
 def calculate_gamma_theta_breakeven(F: float, atm_iv: float, dte: float):
@@ -278,7 +294,8 @@ def filter_session_data(df, data_type):
     end_time = start_time + timedelta(hours=15)
 
     if data_type == "Intraday":
-        df = df[~df['Header1'].str.contains("Open Interest", case=False, na=False)]
+        print(f"filter_session_data: Intraday filter applied, keeping only 'Intraday Volume' rows")
+        df = df[df['Header1'].str.contains("Intraday Volume", case=False, na=False)]
     elif data_type == "OI":
         df = df[df['Header1'].str.contains("Open Interest", case=False, na=False)]
 
@@ -313,10 +330,13 @@ def fetch_github_history(file_path, max_commits=200):
         )
         try:
             response = requests.get(api_url, headers=headers, timeout=10)
-        except Exception:
+        except Exception as e:
+            print(f"Error fetching commits from GitHub: {api_url}")
+            print(f"Exception: {e.with_traceback()}")
             break
 
         if response.status_code != 200:
+            print(f"GitHub API error: {response.status_code} for URL: {api_url}")
             break
         commits = response.json()
         if not commits:
@@ -358,7 +378,9 @@ def fetch_github_history(file_path, max_commits=200):
                 df['Header1']  = h1
                 df['Header2']  = h2
                 return df
-        except Exception:
+        except Exception as ex:
+            print(f"Error downloading file from GitHub: {raw_url}")
+            print(f"Exception: {ex.with_traceback()}")
             pass
         return None
 
@@ -409,12 +431,41 @@ if 'fetch_mode'    not in st.session_state: st.session_state.fetch_mode    = "�
 if 'last_auto_check' not in st.session_state: st.session_state.last_auto_check = 0.0
 if 'sha_intra'     not in st.session_state: st.session_state.sha_intra     = None
 if 'sha_oi'        not in st.session_state: st.session_state.sha_oi        = None
+if 'data_session_date' not in st.session_state: st.session_state.data_session_date = None
 
-if 'my_intraday_data' not in st.session_state:
-    raw_intra = fetch_github_history("IntradayData.txt", max_commits=200)
+# ── Compute current session date (Bangkok timezone) ──
+_now_bkk = pd.Timestamp.now(tz='Asia/Bangkok')
+_current_session_date = (_now_bkk - timedelta(days=1)).date() if _now_bkk.hour < 10 else _now_bkk.date()
+
+# ── Force re-fetch if session date has changed (fixes stale date bug) ──
+_date_changed = (
+    st.session_state.data_session_date is not None
+    and st.session_state.data_session_date != _current_session_date
+)
+
+if _date_changed and ('my_intraday_data' in st.session_state and 'my_oi_data' in st.session_state):
+    # Check empty
+    if st.session_state.my_intraday_data.empty:
+        raw_intra = fetch_github_history("IntradayData.txt", max_commits=200)
+        st.session_state.my_intraday_data = filter_session_data(raw_intra, "Intraday")
+    
+    if st.session_state.my_oi_data.empty:
+        raw_oi = fetch_github_history("OIData.txt", max_commits=1)
+        st.session_state.my_oi_data = filter_session_data(raw_oi, "OI")
+
+    st.session_state.sha_intra = None
+    st.session_state.sha_oi    = None
+    st.session_state.last_auto_check = 0.0
+
+if ('my_intraday_data' not in st.session_state or st.session_state.my_intraday_data.empty) and ('my_oi_data' not in st.session_state or st.session_state.my_oi_data.empty):
+    raw_intra = fetch_github_history("IntradayData.txt", max_commits=10)
     raw_oi    = fetch_github_history("OIData.txt",       max_commits=1)
+    filtered_intraday = filter_session_data(raw_intra, "Intraday")
+    filtered_o = filter_session_data(raw_oi,    "OI")
     st.session_state.my_intraday_data = filter_session_data(raw_intra, "Intraday")
     st.session_state.my_oi_data       = filter_session_data(raw_oi,    "OI")
+    st.session_state.data_session_date = _current_session_date
+    print(f"Initial data load: Intraday rows={len(raw_intra)}, OI rows={len(raw_oi)}, session date={st.session_state}")
 
 # ==========================================
 # ─── Top Controls ───
@@ -429,6 +480,7 @@ with col_dropdown:
     )
 
 with col_mode:
+    _prev_fetch_mode = st.session_state.fetch_mode
     fetch_mode = st.selectbox(
         "Fetch Mode",
         ["📋 Manual", "🔄 Auto (1 min)"],
@@ -437,12 +489,19 @@ with col_mode:
         key="fetch_mode_select",
     )
     st.session_state.fetch_mode = fetch_mode
+    # When switching TO Auto mode, seed the timer so the first cycle
+    # waits a full interval instead of firing immediately (which would
+    # rerun before the chart finishes rendering).
+    if fetch_mode == "🔄 Auto (1 min)" and _prev_fetch_mode != fetch_mode:
+        st.session_state.last_auto_check = time.time()
 
 with col_spin:
     status_placeholder = st.empty()
 
     df_intraday = st.session_state.my_intraday_data
     df_oi       = st.session_state.my_oi_data
+    print(f"Intraday data loaded: {not df_intraday.empty}, OI data loaded: {not df_oi.empty}")
+    print(f"Intraday data length: {len(df_intraday)}, OI data length: {len(df_oi)}")
     if not df_intraday.empty:
         last_fetch = df_intraday['Datetime'].max().strftime("%H:%M:%S")
         status_placeholder.caption(f"⏱  ข้อมูลล่าสุดเวลา **{last_fetch}** น.")
@@ -743,13 +802,13 @@ if not df_intraday.empty:
             .copy()
             .sort_values('Strike')
         )
-        gex_flip_i = pos_wall_i = neg_wall_i = None
+        gex_flip_i = pos_wall_i = neg_wall_i = gex_peak_i = None
         lo_exp_i = hi_exp_i = lo_day_i = hi_day_i = None
 
         if atm_intra and dte_intra:
             iv_atm_i = get_atm_iv(frame_raw, atm_intra)
             if iv_atm_i and dte_intra > 0:
-                gex_flip_i, pos_wall_i, neg_wall_i, _ = calculate_gex_analysis(
+                gex_flip_i, pos_wall_i, neg_wall_i, _, gex_peak_i = calculate_gex_analysis(
                     frame_raw, atm_intra, dte_intra
                 )
                 lo_exp_i, hi_exp_i, lo_day_i, hi_day_i = calculate_gamma_theta_breakeven(
@@ -803,6 +862,14 @@ if not df_intraday.empty:
         if lo_exp_i and hi_exp_i:
             _add_theta_breakeven_vlines(fig_intra, lo_exp_i, hi_exp_i, lo_day_i, hi_day_i)
         _add_gex_vlines(fig_intra, gex_flip_i, pos_wall_i, neg_wall_i)
+        if gex_peak_i is not None:
+            fig_intra.add_vline(
+                x=gex_peak_i, line_dash="dot", line_color="#C084FC",
+                line_width=1.5, opacity=0.7,
+                annotation_text="GEX Peak",
+                annotation_position="top right",
+                annotation_font=dict(color="#C084FC", size=10),
+            )
 
         fig_intra.update_layout(
             barmode='group', bargap=0.15, height=500,
@@ -820,11 +887,13 @@ if not df_intraday.empty:
         render_line_legend()
 
         # ── GEX / Breakeven info row ──
-        if gex_flip_i or lo_exp_i:
+        if gex_flip_i or gex_peak_i or lo_exp_i:
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             with mc1:
                 if gex_flip_i:
                     st.metric("🟣 GEX Flip (B76)", f"{gex_flip_i:,.1f}")
+                elif gex_peak_i:
+                    st.metric("🟣 GEX Peak (B76)", f"{gex_peak_i:,.1f}")
             with mc2:
                 if pos_wall_i:
                     st.metric("🟢 +GEX Wall", f"{pos_wall_i:,.0f}")
@@ -934,13 +1003,13 @@ if not df_intraday.empty:
                 .copy()
                 .sort_values('Strike')
             )
-            gex_flip_o = pos_wall_o = neg_wall_o = None
+            gex_flip_o = pos_wall_o = neg_wall_o = gex_peak_o = None
             lo_exp_o = hi_exp_o = lo_day_o = hi_day_o = None
 
             if atm_oi and dte_oi:
                 iv_atm_o = get_atm_iv(oi_raw, atm_oi)
                 if iv_atm_o and dte_oi > 0:
-                    gex_flip_o, pos_wall_o, neg_wall_o, _ = calculate_gex_analysis(
+                    gex_flip_o, pos_wall_o, neg_wall_o, _, gex_peak_o = calculate_gex_analysis(
                         oi_raw, atm_oi, dte_oi
                     )
                     lo_exp_o, hi_exp_o, lo_day_o, hi_day_o = calculate_gamma_theta_breakeven(
@@ -994,6 +1063,14 @@ if not df_intraday.empty:
             if lo_exp_o and hi_exp_o:
                 _add_theta_breakeven_vlines(fig_oi, lo_exp_o, hi_exp_o, lo_day_o, hi_day_o)
             _add_gex_vlines(fig_oi, gex_flip_o, pos_wall_o, neg_wall_o)
+            if gex_peak_o is not None:
+                fig_oi.add_vline(
+                    x=gex_peak_o, line_dash="dot", line_color="#C084FC",
+                    line_width=1.5, opacity=0.7,
+                    annotation_text="GEX Peak",
+                    annotation_position="top right",
+                    annotation_font=dict(color="#C084FC", size=10),
+                )
 
             fig_oi.update_layout(
                 barmode='group', bargap=0.15, height=500,
@@ -1011,11 +1088,13 @@ if not df_intraday.empty:
             render_line_legend()
 
             # ── GEX / Breakeven info row ──
-            if gex_flip_o or lo_exp_o:
+            if gex_flip_o or gex_peak_o or lo_exp_o:
                 mc1, mc2, mc3, mc4, mc5 = st.columns(5)
                 with mc1:
                     if gex_flip_o:
                         st.metric("🟣 GEX Flip (B76)", f"{gex_flip_o:,.1f}")
+                    elif gex_peak_o:
+                        st.metric("🟣 GEX Peak (B76)", f"{gex_peak_o:,.1f}")
                 with mc2:
                     if pos_wall_o:
                         st.metric("🟢 +GEX Wall", f"{pos_wall_o:,.0f}")
