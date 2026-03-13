@@ -1083,8 +1083,6 @@ if st.session_state.fetch_mode == "🔄 Auto (1 min)":
         )
 
         if data_changed:
-            # Clear data cache and reload fresh content
-            fetch_github_history.clear()
             raw_i = fetch_github_history("IntradayData.txt", max_commits=200)
             raw_o = fetch_github_history("OIData.txt",       max_commits=1)
             st.session_state.my_intraday_data = filter_session_data(raw_i, "Intraday")
