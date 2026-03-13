@@ -801,15 +801,16 @@ if not df_intraday.empty:
         if 'anim_idx' in st.session_state and st.session_state.anim_idx < len(available_times):
             st.session_state.selected_time_state = available_times[st.session_state.anim_idx]
 
-    tab1, tab2 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
+        ":material/query_stats: GBT Analysis",
         ":material/show_chart: Intraday Volume",
         ":material/account_balance: Open Interest (OI)",
     ])
 
     # ══════════════════════════════════════
-    # TAB 1 – Intraday Volume
+    # TAB 2 – Intraday Volume
     # ══════════════════════════════════════
-    with tab1:
+    with tab2:
         time_val   = st.session_state.selected_time_state
         frame_data = (
             df_intraday[df_intraday['Time'] == time_val]
@@ -1079,7 +1080,7 @@ if not df_intraday.empty:
     # ══════════════════════════════════════
     # TAB 2 – Open Interest
     # ══════════════════════════════════════
-    with tab2:
+    with tab3:
         if not df_oi.empty:
             latest_oi = (
                 df_oi[df_oi['Datetime'] == df_oi['Datetime'].max()]
@@ -1291,6 +1292,661 @@ if not df_intraday.empty:
                     pd.DataFrame(be_data_o),
                     hide_index=True, use_container_width=True,
                 )
+
+    # ══════════════════════════════════════════════════════════════════
+    # TAB 3 – GBT Analysis  (Composite OI + Intraday Volume)
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # Theory (from project papers):
+    #
+    # 1. GEX (SqueezeMetrics white paper):
+    #    GEX_K = Γ_B76(F,K,T,σ) × (Call − Put) × F² × 0.01
+    #    OI → structural dealer positions (Commitment)
+    #    Vol → intraday order flow (Noise / Activity)
+    #
+    # 2. Composite blending (GBT v5 / SpotGamma approach):
+    #    Composite_K = GEX_OI_K × (1−α) + γ-Flow_K × α
+    #    α controls how much intraday activity overrides structural OI
+    #
+    # 3. GTBR — Gamma-Theta Breakeven Range (Park & Zhao 2024 eq.1):
+    #    PnL_daily = θ/365 + 50·Γ·r²
+    #    GTBR = ± √(−θ / (365·50·Γ))  ≈  F·σ/√365  (at ATM, Black-76)
+    #    Price exits GTBR → MM's PnL turns negative → forced rebalancing
+    #    → creates inelastic demand → intraday momentum
+    #
+    # 4. Regime (Bossu et al. 2005, thesis eq.27-28):
+    #    Net GEX > 0 → dealers long gamma → mean-revert (stabilising)
+    #    Net GEX < 0 → dealers short gamma → trend-follow (amplifying)
+    #
+    # 5. Convergence signal:
+    #    OI wall ≈ Vol wall → high conviction (structural + flow agree)
+    #    OI wall ≠ Vol wall → market shifting / repositioning in progress
+    #
+    # 6. Block detection:
+    #    |γ-Flow_K / GEX_OI_K| ≥ threshold → institutional block print
+    # ══════════════════════════════════════════════════════════════════
+    with tab1:
+        if df_oi.empty or df_intraday.empty:
+            st.warning(
+                "⚠ ต้องมีข้อมูลทั้ง **Intraday Volume** และ **Open Interest** "
+                "เพื่อวิเคราะห์ GBT — กรุณา Refresh"
+            )
+        else:
+            # ── Latest snapshots (same logic as tab1/tab2) ──
+            _vol_snap = (
+                df_intraday[
+                    df_intraday['Time'] == st.session_state.selected_time_state
+                ].copy().sort_values('Strike')
+            )
+            _oi_snap = (
+                df_oi[df_oi['Datetime'] == df_oi['Datetime'].max()]
+                .copy().sort_values('Strike')
+            )
+
+            if _vol_snap.empty or _oi_snap.empty:
+                st.warning("⚠ ไม่พบข้อมูลที่ตรงกัน กรุณา Refresh")
+            else:
+                # ── ATM / DTE ──
+                _h1_v = _vol_snap['Header1'].iloc[0]
+                _h1_o = _oi_snap['Header1'].iloc[0]
+                _atm_v = extract_atm(_h1_v)
+                _atm_o = extract_atm(_h1_o)
+                _dte_v = extract_dte(_h1_v)
+                _dte_o = extract_dte(_h1_o)
+
+                # v5 FIX: prefer Intraday DTE (fresher) for all Greeks
+                _dte = _dte_v if _dte_v and _dte_v > 0 else _dte_o
+                _atm = _atm_v if _atm_v else _atm_o
+
+                if not _atm or not _dte:
+                    st.error("❌ ไม่สามารถดึง ATM/DTE จาก header ได้")
+                else:
+                    # ── Styled header ──
+                    st.markdown(get_styled_header(
+                        f"GBT Composite — ATM {_atm:,.1f}  |  "
+                        f"DTE {_dte:.2f} (Intraday)",
+                        f"OI: {_h1_o}  •  Vol: {_h1_v}",
+                    ), unsafe_allow_html=True)
+
+                    # ── Alpha slider ──
+                    _alpha = st.slider(
+                        "α — Intraday Volume Weight  "
+                        "(0 = OI only · 0.4 = recommended · 1 = Vol only)",
+                        0.0, 1.0, 0.4, 0.05,
+                        key="gbt_alpha",
+                    )
+                    _block_thr = 2.0   # Vol/OI ratio for block detection
+
+                    # ── Compute both GEX layers with SAME DTE ──
+                    _iv_v = get_atm_iv(_vol_snap, _atm)
+                    _iv_o = get_atm_iv(_oi_snap, _atm)
+                    _iv_comp = _iv_v if _iv_v else _iv_o
+
+                    _gf_v = _pw_v = _nw_v = _pk_v = None
+                    _gdf_v = None
+                    if _iv_v:
+                        (_gf_v, _pw_v, _nw_v,
+                         _gdf_v, _pk_v) = calculate_gex_analysis(
+                            _vol_snap, _atm, _dte, "Intraday"
+                        )
+
+                    _gf_o = _pw_o = _nw_o = _pk_o = None
+                    _gdf_o = None
+                    if _iv_o:
+                        (_gf_o, _pw_o, _nw_o,
+                         _gdf_o, _pk_o) = calculate_gex_analysis(
+                            _oi_snap, _atm, _dte, "OI"
+                        )
+
+                    # ── Build composite per-strike table ──
+                    _rows = []
+                    if _gdf_o is not None and _gdf_v is not None:
+                        _m_oi  = _gdf_o.set_index('Strike')
+                        _m_vol = _gdf_v.set_index('Strike')
+                        _all_K = sorted(
+                            set(_m_oi.index.tolist()
+                                + _m_vol.index.tolist())
+                        )
+                        for K in _all_K:
+                            g_oi  = float(_m_oi.loc[K, 'Net_GEX']) if K in _m_oi.index else 0.0
+                            g_vol = float(_m_vol.loc[K, 'Net_GEX']) if K in _m_vol.index else 0.0
+                            comp  = (1 - _alpha) * g_oi + _alpha * g_vol
+
+                            c_oi  = float(_m_oi.loc[K, 'Call']) if K in _m_oi.index else 0
+                            p_oi  = float(_m_oi.loc[K, 'Put'])  if K in _m_oi.index else 0
+                            c_vol = float(_m_vol.loc[K, 'Call']) if K in _m_vol.index else 0
+                            p_vol = float(_m_vol.loc[K, 'Put'])  if K in _m_vol.index else 0
+
+                            is_block = (
+                                abs(g_oi) > 0
+                                and abs(g_vol / g_oi) >= _block_thr
+                            )
+
+                            _rows.append({
+                                'Strike': K,
+                                'Call_OI': c_oi, 'Put_OI': p_oi,
+                                'Call_Vol': c_vol, 'Put_Vol': p_vol,
+                                'GEX_OI': g_oi,
+                                'γ_Flow': g_vol,
+                                'Composite': comp,
+                                'Block': is_block,
+                            })
+
+                    _cdf = pd.DataFrame(_rows)
+
+                    if _cdf.empty:
+                        st.warning(
+                            "⚠ ไม่สามารถสร้าง Composite GEX ได้ "
+                            "— ตรวจสอบข้อมูล OI/Vol"
+                        )
+                    else:
+                        _cdf = _cdf.sort_values('Strike').reset_index(drop=True)
+                        _cdf['Cumulative'] = _cdf['Composite'].cumsum()
+
+                        # ── Composite Flip ──
+                        _c_flip = None
+                        for i in range(1, len(_cdf)):
+                            _p = _cdf.loc[i-1, 'Cumulative']
+                            _c = _cdf.loc[i,   'Cumulative']
+                            if _p * _c <= 0:
+                                _d = abs(_p) + abs(_c)
+                                _w = abs(_p) / _d if _d > 0 else 0.5
+                                _c_flip = (
+                                    _cdf.loc[i-1, 'Strike']
+                                    + _w * (_cdf.loc[i, 'Strike']
+                                            - _cdf.loc[i-1, 'Strike'])
+                                )
+                                break
+
+                        # ── Composite Walls ──
+                        _c_pw = (
+                            _cdf.loc[_cdf['Composite'].idxmax(), 'Strike']
+                            if _cdf['Composite'].max() > 0 else None
+                        )
+                        _c_nw = (
+                            _cdf.loc[_cdf['Composite'].idxmin(), 'Strike']
+                            if _cdf['Composite'].min() < 0 else None
+                        )
+
+                        # ── Net regime ──
+                        _net = _cdf['Composite'].sum()
+                        _regime = (
+                            "LONG γ — Mean-Revert"
+                            if _net >= 0
+                            else "SHORT γ — Trend-Follow"
+                        )
+
+                        # ── GTBR ──
+                        _le = _he = _ld = _hd = None
+                        if _iv_comp and _dte > 0:
+                            _le, _he, _ld, _hd = (
+                                calculate_gamma_theta_breakeven(
+                                    _atm, _iv_comp, _dte)
+                            )
+
+                        # ── Block count ──
+                        _n_blocks = int(_cdf['Block'].sum())
+
+                        # ── Convergence ──
+                        _conv = []
+                        if _pw_o and _pw_v:
+                            if abs(_pw_o - _pw_v) <= 25:
+                                _conv.append(
+                                    "✅ +Wall converged → "
+                                    "high-conviction resistance"
+                                )
+                            else:
+                                _conv.append(
+                                    f"⚠ +Wall diverge: "
+                                    f"OI {_pw_o:.0f} vs Vol {_pw_v:.0f}"
+                                )
+                        if _nw_o and _nw_v:
+                            if abs(_nw_o - _nw_v) <= 25:
+                                _conv.append(
+                                    "✅ −Wall converged → "
+                                    "high-conviction support"
+                                )
+                            else:
+                                _conv.append(
+                                    f"⚠ −Wall diverge: "
+                                    f"OI {_nw_o:.0f} vs Vol {_nw_v:.0f}"
+                                )
+
+                        # ═════════════════════════════════════
+                        #  CHART: 2-row subplot
+                        # ═════════════════════════════════════
+                        _fig = make_subplots(
+                            rows=2, cols=1,
+                            shared_xaxes=True,
+                            row_heights=[0.65, 0.35],
+                            vertical_spacing=0.06,
+                            subplot_titles=(
+                                "Composite GEX per Strike",
+                                "Cumulative Composite GEX",
+                            ),
+                        )
+
+                        # Row 1 — bars + composite line
+                        _fig.add_trace(go.Bar(
+                            x=_cdf['Strike'], y=_cdf['GEX_OI'],
+                            name='GEX (OI)',
+                            marker=dict(color=[
+                                'rgba(34,197,94,0.45)' if v >= 0
+                                else 'rgba(239,68,68,0.45)'
+                                for v in _cdf['GEX_OI']
+                            ]),
+                            opacity=0.75,
+                        ), row=1, col=1)
+
+                        _fig.add_trace(go.Bar(
+                            x=_cdf['Strike'], y=_cdf['γ_Flow'],
+                            name='γ-Flow (Vol)',
+                            marker=dict(color=[
+                                'rgba(59,130,246,0.55)' if v >= 0
+                                else 'rgba(251,146,60,0.55)'
+                                for v in _cdf['γ_Flow']
+                            ]),
+                            opacity=0.75,
+                        ), row=1, col=1)
+
+                        _fig.add_trace(go.Scatter(
+                            x=_cdf['Strike'],
+                            y=_cdf['Composite'],
+                            name=f'Composite (α={_alpha:.2f})',
+                            mode='lines+markers',
+                            line=dict(color='#FBBF24', width=2.5),
+                            marker=dict(size=4),
+                        ), row=1, col=1)
+
+                        # Block markers
+                        _blk = _cdf[_cdf['Block']]
+                        if not _blk.empty:
+                            _fig.add_trace(go.Scatter(
+                                x=_blk['Strike'],
+                                y=_blk['Composite'],
+                                name='Block Trade',
+                                mode='markers',
+                                marker=dict(
+                                    symbol='diamond',
+                                    size=10,
+                                    color='#E879F9',
+                                    line=dict(width=1, color='white'),
+                                ),
+                            ), row=1, col=1)
+
+                        # Row 2 — cumulative fill
+                        _fig.add_trace(go.Scatter(
+                            x=_cdf['Strike'],
+                            y=_cdf['Cumulative'],
+                            name='Σ Composite',
+                            fill='tozeroy',
+                            line=dict(color='#A855F7', width=2),
+                            fillcolor='rgba(168,85,247,0.15)',
+                        ), row=2, col=1)
+
+                        # ── Reference lines on both rows ──
+                        for _r in [1, 2]:
+                            _fig.add_vline(
+                                x=_atm, line_dash="dash",
+                                line_color="#888", opacity=0.8,
+                                row=_r, col=1,
+                                annotation_text="ATM" if _r == 1 else None,
+                                annotation_position="top",
+                            )
+                            if _le and _he:
+                                for _xv, _lb in [
+                                    (_le, "GTBR↓"), (_he, "GTBR↑"),
+                                ]:
+                                    _fig.add_vline(
+                                        x=_xv, line_dash="dash",
+                                        line_color="#FB923C",
+                                        line_width=2, opacity=0.85,
+                                        row=_r, col=1,
+                                        annotation_text=(
+                                            _lb if _r == 1 else None
+                                        ),
+                                        annotation_font=dict(
+                                            color="#FB923C", size=9),
+                                    )
+                            if _ld and _hd:
+                                for _xv, _lb in [
+                                    (_ld, "1D↓"), (_hd, "1D↑"),
+                                ]:
+                                    _fig.add_vline(
+                                        x=_xv, line_dash="dot",
+                                        line_color="#FCD34D",
+                                        line_width=1.5, opacity=0.7,
+                                        row=_r, col=1,
+                                        annotation_text=(
+                                            _lb if _r == 1 else None
+                                        ),
+                                        annotation_font=dict(
+                                            color="#FCD34D", size=8),
+                                    )
+                            if _c_flip:
+                                _fig.add_vline(
+                                    x=_c_flip, line_dash="dot",
+                                    line_color="#A855F7",
+                                    line_width=2, opacity=0.9,
+                                    row=_r, col=1,
+                                    annotation_text=(
+                                        "Flip" if _r == 2 else None
+                                    ),
+                                    annotation_font=dict(
+                                        color="#A855F7", size=10),
+                                )
+                            if _c_pw:
+                                _fig.add_vline(
+                                    x=_c_pw, line_dash="dashdot",
+                                    line_color="#22C55E",
+                                    line_width=1.5, opacity=0.7,
+                                    row=_r, col=1,
+                                    annotation_text=(
+                                        "+Wall" if _r == 1 else None
+                                    ),
+                                    annotation_font=dict(
+                                        color="#22C55E", size=9),
+                                )
+                            if _c_nw:
+                                _fig.add_vline(
+                                    x=_c_nw, line_dash="dashdot",
+                                    line_color="#F43F5E",
+                                    line_width=1.5, opacity=0.7,
+                                    row=_r, col=1,
+                                    annotation_text=(
+                                        "−Wall" if _r == 1 else None
+                                    ),
+                                    annotation_font=dict(
+                                        color="#F43F5E", size=9),
+                                )
+
+                        _fig.update_layout(
+                            barmode='group', bargap=0.15,
+                            height=700,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            hovermode="x unified",
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom", y=1.03,
+                                xanchor="center", x=0.5,
+                            ),
+                            margin=dict(l=10, r=10, t=40, b=10),
+                        )
+                        _fig.update_xaxes(
+                            title_text="Strike Price",
+                            row=2, col=1,
+                            showgrid=True,
+                            gridcolor='rgba(128,128,128,0.2)',
+                        )
+                        _fig.update_yaxes(
+                            title_text="Net GEX / γ-Flow",
+                            row=1, col=1,
+                            showgrid=True,
+                            gridcolor='rgba(128,128,128,0.2)',
+                        )
+                        _fig.update_yaxes(
+                            title_text="Σ Composite",
+                            row=2, col=1,
+                            showgrid=True,
+                            gridcolor='rgba(128,128,128,0.2)',
+                        )
+                        st.plotly_chart(
+                            _fig, use_container_width=True
+                        )
+
+                        # ── Legend ──
+                        render_line_legend()
+
+                        # ═════════════════════════════════════
+                        #  METRICS DASHBOARD
+                        # ═════════════════════════════════════
+                        st.markdown("---")
+                        st.markdown(
+                            "### :material/dashboard: "
+                            "GBT Regime Dashboard"
+                        )
+
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        with m1:
+                            _rcol = (
+                                "green" if _net >= 0 else "red"
+                            )
+                            _rbg = (
+                                'rgba(34,197,94,0.15)'
+                                if _net >= 0
+                                else 'rgba(239,68,68,0.15)'
+                            )
+                            st.markdown(
+                                f"<div style='text-align:center;"
+                                f"padding:8px;border-radius:8px;"
+                                f"background:{_rbg};"
+                                f"border:1px solid {_rcol}'>"
+                                f"<b style='color:{_rcol};"
+                                f"font-size:14px'>{_regime}</b>"
+                                f"<br><span style='font-size:12px;"
+                                f"color:gray'>"
+                                f"Net: {_net:,.1f}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                        with m2:
+                            st.metric(
+                                "🟣 Composite Flip",
+                                f"{_c_flip:,.1f}"
+                                if _c_flip else "N/A",
+                            )
+                        with m3:
+                            st.metric(
+                                "🟢 +Wall",
+                                f"{_c_pw:,.0f}"
+                                if _c_pw else "—",
+                            )
+                        with m4:
+                            st.metric(
+                                "🔴 −Wall",
+                                f"{_c_nw:,.0f}"
+                                if _c_nw else "—",
+                            )
+                        with m5:
+                            if _le and _he:
+                                st.metric(
+                                    "🟠 GTBR Expiry",
+                                    f"{_le:,.0f}–{_he:,.0f}",
+                                )
+                            elif _ld and _hd:
+                                st.metric(
+                                    "🟡 GTBR Daily",
+                                    f"{_ld:,.0f}–{_hd:,.0f}",
+                                )
+
+                        # ── Convergence info ──
+                        if _conv:
+                            st.info(
+                                "**Convergence:**  "
+                                + "  |  ".join(_conv)
+                            )
+
+                        # ── Block info ──
+                        if _n_blocks > 0:
+                            _blk_detail = _cdf[_cdf['Block']][[
+                                'Strike', 'Call_Vol', 'Put_Vol',
+                                'γ_Flow', 'GEX_OI',
+                            ]].copy()
+                            _blk_detail['Ratio'] = (
+                                _blk_detail['γ_Flow'].abs()
+                                / _blk_detail['GEX_OI'].abs()
+                                .replace(0, np.nan)
+                            ).round(2)
+                            st.warning(
+                                f"🟣 **{_n_blocks} Block Trade(s) "
+                                f"detected** "
+                                f"(Vol/OI ratio ≥ {_block_thr}x)"
+                            )
+                            st.dataframe(
+                                _blk_detail,
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                        # ═════════════════════════════════════
+                        #  WALL COMPARISON TABLE
+                        # ═════════════════════════════════════
+                        st.markdown("---")
+                        st.markdown(
+                            "### :material/compare_arrows: "
+                            "OI vs Vol — Wall Comparison"
+                        )
+                        _wt = {
+                            "Level": [
+                                "+GEX Wall (Resistance)",
+                                "−GEX Wall (Support)",
+                                "Flip Point",
+                                "GTBR Daily",
+                                "GTBR Expiry",
+                            ],
+                            "OI": [
+                                f"{_pw_o:,.0f}" if _pw_o else "—",
+                                f"{_nw_o:,.0f}" if _nw_o else "—",
+                                f"{_gf_o:,.1f}" if _gf_o else "—",
+                                (f"{_ld:,.0f}–{_hd:,.0f}"
+                                 if _ld else "—"),
+                                (f"{_le:,.0f}–{_he:,.0f}"
+                                 if _le else "—"),
+                            ],
+                            "Vol": [
+                                f"{_pw_v:,.0f}" if _pw_v else "—",
+                                f"{_nw_v:,.0f}" if _nw_v else "—",
+                                f"{_gf_v:,.1f}" if _gf_v else "—",
+                                "=", "=",
+                            ],
+                            f"Comp (α={_alpha})": [
+                                (f"{_c_pw:,.0f}"
+                                 if _c_pw else "—"),
+                                (f"{_c_nw:,.0f}"
+                                 if _c_nw else "—"),
+                                (f"{_c_flip:,.1f}"
+                                 if _c_flip else "—"),
+                                (f"{_ld:,.0f}–{_hd:,.0f}"
+                                 if _ld else "—"),
+                                (f"{_le:,.0f}–{_he:,.0f}"
+                                 if _le else "—"),
+                            ],
+                        }
+                        st.dataframe(
+                            pd.DataFrame(_wt),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                        # ═════════════════════════════════════
+                        #  COMPOSITE DATA TABLE
+                        # ═════════════════════════════════════
+                        st.markdown("---")
+                        st.markdown(
+                            "### :material/table_chart: "
+                            "Composite Strike Data"
+                        )
+                        st.caption(
+                            f"Composite = GEX_OI×(1−{_alpha:.2f})"
+                            f" + γ-Flow×{_alpha:.2f}  |  "
+                            f"DTE {_dte:.2f} (Intraday)  |  "
+                            f"Black-76"
+                        )
+                        _disp = _cdf[[
+                            'Strike', 'Call_OI', 'Put_OI',
+                            'Call_Vol', 'Put_Vol',
+                            'GEX_OI', 'γ_Flow',
+                            'Composite', 'Cumulative', 'Block',
+                        ]].copy()
+                        _disp.columns = [
+                            'Strike', 'Call OI', 'Put OI',
+                            'Call Vol', 'Put Vol',
+                            'GEX (OI)', 'γ-Flow',
+                            'Comp GEX', 'Σ Comp', 'Block',
+                        ]
+                        st.dataframe(
+                            _disp,
+                            column_config={
+                                "Strike":
+                                    st.column_config.NumberColumn(
+                                        "Strike", format="%d"),
+                                "Call OI":
+                                    st.column_config.NumberColumn(
+                                        "Call OI", format="%d"),
+                                "Put OI":
+                                    st.column_config.NumberColumn(
+                                        "Put OI", format="%d"),
+                                "Call Vol":
+                                    st.column_config.NumberColumn(
+                                        "Call Vol", format="%d"),
+                                "Put Vol":
+                                    st.column_config.NumberColumn(
+                                        "Put Vol", format="%d"),
+                                "GEX (OI)":
+                                    st.column_config.NumberColumn(
+                                        "GEX (OI)", format="%.2f"),
+                                "γ-Flow":
+                                    st.column_config.NumberColumn(
+                                        "γ-Flow", format="%.2f"),
+                                "Comp GEX":
+                                    st.column_config.NumberColumn(
+                                        "Comp GEX", format="%.2f"),
+                                "Σ Comp":
+                                    st.column_config.NumberColumn(
+                                        "Σ Comp", format="%.2f"),
+                                "Block":
+                                    st.column_config.CheckboxColumn(
+                                        "Block"),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                            height=600,
+                        )
+
+                        # ═════════════════════════════════════
+                        #  GTBR DETAIL TABLE
+                        # ═════════════════════════════════════
+                        if _iv_comp and _dte > 0:
+                            st.markdown("---")
+                            st.markdown(
+                                "### :material/balance: "
+                                "γ/θ Breakeven Range — Composite"
+                            )
+                            _gd = {
+                                "Metric": [
+                                    "Futures (ATM)",
+                                    "ATM IV (σ) — Intraday",
+                                    "DTE (Intraday)",
+                                    "T (years)",
+                                    "γ/θ Daily ΔF = F·σ/√365",
+                                    "γ/θ Daily Range",
+                                    "γ/θ Expiry ΔF = F·σ·√T",
+                                    "γ/θ Expiry Range",
+                                    "Net Composite GEX",
+                                    "Regime",
+                                    "Blocks Detected",
+                                ],
+                                "Value": [
+                                    f"{_atm:,.1f}",
+                                    f"{_iv_comp*100:.2f} %",
+                                    f"{_dte:.2f}",
+                                    f"{_dte/365:.6f}",
+                                    f"± {_atm * _iv_comp / math.sqrt(365):.1f}",
+                                    (f"{_ld:,.1f}–{_hd:,.1f}"
+                                     if _ld else "N/A"),
+                                    f"± {_atm * _iv_comp * math.sqrt(_dte / 365):.1f}",
+                                    (f"{_le:,.1f}–{_he:,.1f}"
+                                     if _le else "N/A"),
+                                    f"{_net:,.2f}",
+                                    _regime,
+                                    str(_n_blocks),
+                                ],
+                            }
+                            st.dataframe(
+                                pd.DataFrame(_gd),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
 
 # ==========================================
 # ─── Auto-Refresh Engine ───
