@@ -261,16 +261,23 @@ def calculate_gex_analysis(df, futures_price: float, dte: float,
 
     Returns
     -------
-    flip   : float | None — strike where cumulative net value crosses zero
+    flip     : float | None — strike where cumulative net value crosses zero
+                              (nearest to ATM / futures_price)
     pos_wall : float | None — strike of highest positive concentration
     neg_wall : float | None — strike of highest negative concentration
-    gex_df : DataFrame     — per-strike detail (Strike, Call, Put, IV%,
-                              Gamma, Net_GEX, Cumulative_GEX)
-    peak   : float | None  — max |value| strike when no zero-crossing exists
+    gex_df   : DataFrame    — per-strike detail (Strike, Call, Put, IV%,
+                               Gamma, Net_GEX, Cumulative_GEX,
+                               Vanna, Volga, Net_Vanna, Net_Volga)
+    peak     : float | None — max |value| strike when no zero-crossing exists
+    net_vanna_total : float — aggregate Net Vanna across all strikes
+    net_volga_total : float — aggregate Net Volga across all strikes
     """
     T = max(dte / 365.0, 1e-6)
 
     gex_rows = []
+    net_vanna_total = 0.0
+    net_volga_total = 0.0
+
     for _, row in df.iterrows():
         K     = float(row['Strike'])
         sigma = _normalize_iv(row['Vol Settle'])
@@ -279,6 +286,18 @@ def calculate_gex_analysis(df, futures_price: float, dte: float,
 
         gamma   = _b76_gamma(futures_price, K, T, sigma)
         net_gex = gamma * (call - put) * (futures_price ** 2) * 0.01
+
+        # ── Per-strike Vanna & Volga ──
+        vanna_k = _b76_vanna(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
+        volga_k = _b76_volga(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
+        # Net Vanna: directional (Call − Put)
+        net_vanna_k = vanna_k * (call - put)
+        # Net Volga: symmetric (Call + Put)
+        net_volga_k = volga_k * (call + put)
+
+        net_vanna_total += net_vanna_k
+        net_volga_total += net_volga_k
+
         gex_rows.append({
             'Strike': K,
             'Call': call,
@@ -286,6 +305,10 @@ def calculate_gex_analysis(df, futures_price: float, dte: float,
             'IV %': round(sigma * 100, 2),
             'Gamma': gamma,
             'Net_GEX': net_gex,
+            'Vanna': vanna_k,
+            'Volga': volga_k,
+            'Net_Vanna': net_vanna_k,
+            'Net_Volga': net_volga_k,
         })
 
     gex_df = (
@@ -293,19 +316,31 @@ def calculate_gex_analysis(df, futures_price: float, dte: float,
         .sort_values('Strike')
         .reset_index(drop=True)
     )
-    gex_df['Cumulative_GEX'] = gex_df['Net_GEX'].cumsum()
+    # ── Restrict to strikes with actual activity (OI or Volume > 0) ──
+    # Zero-crossings at strikes with no market activity are noise.
+    active_df = gex_df[(gex_df['Call'] > 0) | (gex_df['Put'] > 0)].copy()
+    active_df = active_df.reset_index(drop=True)
 
-    # ── Flip point: first zero-crossing of cumulative net value ──
-    flip = None
-    for i in range(1, len(gex_df)):
-        prev_cum = gex_df.loc[i - 1, 'Cumulative_GEX']
-        curr_cum = gex_df.loc[i,     'Cumulative_GEX']
-        if prev_cum * curr_cum <= 0:
+    gex_df['Cumulative_GEX'] = gex_df['Net_GEX'].cumsum()
+    active_df['Cumulative_GEX'] = active_df['Net_GEX'].cumsum()
+
+    # ── Flip point: zero-crossing of cumulative GEX nearest to ATM ──
+    # Only consider strikes where OI/Volume > 0 to avoid spurious crossings.
+    all_crossings = []
+    for i in range(1, len(active_df)):
+        prev_cum = active_df.loc[i - 1, 'Cumulative_GEX']
+        curr_cum = active_df.loc[i,     'Cumulative_GEX']
+        if prev_cum * curr_cum <= 0 and not (prev_cum == 0 and curr_cum == 0):
             denom = abs(prev_cum) + abs(curr_cum)
             w = abs(prev_cum) / denom if denom > 0 else 0.5
-            flip = (gex_df.loc[i - 1, 'Strike']
-                    + w * (gex_df.loc[i, 'Strike'] - gex_df.loc[i - 1, 'Strike']))
-            break
+            cross = (active_df.loc[i - 1, 'Strike']
+                     + w * (active_df.loc[i, 'Strike'] - active_df.loc[i - 1, 'Strike']))
+            all_crossings.append(cross)
+
+    # Pick the crossing nearest to ATM (futures_price)
+    flip = None
+    if all_crossings:
+        flip = min(all_crossings, key=lambda x: abs(x - futures_price))
 
     # When no zero-crossing exists, flip stays None.
     # Return peak (max |value| strike) as a separate concept.
@@ -321,7 +356,7 @@ def calculate_gex_analysis(df, futures_price: float, dte: float,
         if gex_df['Net_GEX'].min() < 0 else None
     )
 
-    return flip, pos_wall, neg_wall, gex_df, peak
+    return flip, pos_wall, neg_wall, gex_df, peak, net_vanna_total, net_volga_total
 
 
 def get_atm_iv(df, futures_price: float) -> float | None:
@@ -1128,11 +1163,12 @@ if not df_intraday.empty:
         gex_df_i = None
         lo_exp_i = hi_exp_i = lo_day_i = hi_day_i = None
         iv_atm_i = None
+        net_vanna_i = net_volga_i = 0.0
 
         if atm_intra and dte_intra:
             iv_atm_i = get_atm_iv(frame_raw, atm_intra)
             if iv_atm_i and dte_intra > 0:
-                gex_flip_i, pos_wall_i, neg_wall_i, gex_df_i, gex_peak_i = calculate_gex_analysis(
+                gex_flip_i, pos_wall_i, neg_wall_i, gex_df_i, gex_peak_i, net_vanna_i, net_volga_i = calculate_gex_analysis(
                     frame_raw, atm_intra, dte_intra, data_mode="Intraday"
                 )
                 lo_exp_i, hi_exp_i, lo_day_i, hi_day_i = calculate_gamma_theta_breakeven(
@@ -1234,6 +1270,18 @@ if not df_intraday.empty:
                 if lo_day_i and hi_day_i:
                     st.metric("🟡 γ/θ Daily Range",
                               f"{lo_day_i:,.1f} – {hi_day_i:,.1f}")
+
+        # ── Vanna & Volga metrics (Intraday Volume-weighted) ──
+        if net_vanna_i != 0 or net_volga_i != 0:
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                _vanna_dir = "Bullish Shift" if net_vanna_i > 0 else "Bearish Shift" if net_vanna_i < 0 else "Neutral"
+                st.metric("🔵 Net Vanna (γ-Flow)", f"{net_vanna_i:,.2f}",
+                          delta=_vanna_dir, delta_color="normal")
+            with vc2:
+                _volga_eff = "Widen BE" if net_volga_i > 0 else "Narrow BE" if net_volga_i < 0 else "Neutral"
+                st.metric("🟣 Net Volga (γ-Flow)", f"{net_volga_i:,.2f}",
+                          delta=_volga_eff, delta_color="off")
 
         # ── Timeline controls ──
         col_play, col_slider = st.columns([1, 10])
@@ -1397,11 +1445,12 @@ if not df_intraday.empty:
             gex_df_o = None
             lo_exp_o = hi_exp_o = lo_day_o = hi_day_o = None
             iv_atm_o = None
+            net_vanna_o = net_volga_o = 0.0
 
             if atm_oi and dte_oi:
                 iv_atm_o = get_atm_iv(oi_raw, atm_oi)
                 if iv_atm_o and dte_oi > 0:
-                    gex_flip_o, pos_wall_o, neg_wall_o, gex_df_o, gex_peak_o = calculate_gex_analysis(
+                    gex_flip_o, pos_wall_o, neg_wall_o, gex_df_o, gex_peak_o, net_vanna_o, net_volga_o = calculate_gex_analysis(
                         oi_raw, atm_oi, dte_oi, data_mode="OI"
                     )
                     lo_exp_o, hi_exp_o, lo_day_o, hi_day_o = calculate_gamma_theta_breakeven(
@@ -1501,6 +1550,18 @@ if not df_intraday.empty:
                     if lo_day_o and hi_day_o:
                         st.metric("🟡 γ/θ Daily Range",
                                   f"{lo_day_o:,.1f} – {hi_day_o:,.1f}")
+
+            # ── Vanna & Volga metrics (OI-based dealer positions) ──
+            if net_vanna_o != 0 or net_volga_o != 0:
+                vc1, vc2 = st.columns(2)
+                with vc1:
+                    _vanna_dir_o = "Bullish Shift" if net_vanna_o > 0 else "Bearish Shift" if net_vanna_o < 0 else "Neutral"
+                    st.metric("🔵 Net Vanna (OI)", f"{net_vanna_o:,.2f}",
+                              delta=_vanna_dir_o, delta_color="normal")
+                with vc2:
+                    _volga_eff_o = "Widen BE" if net_volga_o > 0 else "Narrow BE" if net_volga_o < 0 else "Neutral"
+                    st.metric("🟣 Net Volga (OI)", f"{net_volga_o:,.2f}",
+                              delta=_volga_eff_o, delta_color="off")
 
             st.markdown("---")
             st.markdown("### :material/analytics: OI Volume Data")
@@ -1674,17 +1735,21 @@ if not df_intraday.empty:
 
                     _gf_v = _pw_v = _nw_v = _pk_v = None
                     _gdf_v = None
+                    _nva_v = _nvg_v = 0.0
                     if _iv_v:
                         (_gf_v, _pw_v, _nw_v,
-                         _gdf_v, _pk_v) = calculate_gex_analysis(
+                         _gdf_v, _pk_v,
+                         _nva_v, _nvg_v) = calculate_gex_analysis(
                             _vol_snap, _atm, _dte, "Intraday"
                         )
 
                     _gf_o = _pw_o = _nw_o = _pk_o = None
                     _gdf_o = None
+                    _nva_o = _nvg_o = 0.0
                     if _iv_o:
                         (_gf_o, _pw_o, _nw_o,
-                         _gdf_o, _pk_o) = calculate_gex_analysis(
+                         _gdf_o, _pk_o,
+                         _nva_o, _nvg_o) = calculate_gex_analysis(
                             _oi_snap, _atm, _dte, "OI"
                         )
 
@@ -1770,8 +1835,10 @@ if not df_intraday.empty:
                         _le = _he = _ld = _hd = None
                         _va_ld = _va_hd = _va_le = _va_he = None
                         _v_shift_d = _v_shift_e = 0.0
-                        _net_vanna = 0.0
-                        _net_volga = 0.0
+                        # Reuse Net Vanna/Volga already computed by
+                        # calculate_gex_analysis (OI-based for dealer hedging)
+                        _net_vanna = _nva_o
+                        _net_volga = _nvg_o
 
                         if _iv_comp and _dte > 0:
                             # Standard GTBR (baseline)
@@ -1779,31 +1846,6 @@ if not df_intraday.empty:
                                 calculate_gamma_theta_breakeven(
                                     _atm, _iv_comp, _dte)
                             )
-
-                            # Compute aggregate Vanna + Volga from OI
-                            T_calc = max(_dte / 365.0, 1e-6)
-                            if _gdf_o is not None:
-                                for _, _row in _gdf_o.iterrows():
-                                    _K = float(_row['Strike'])
-                                    _sig = _row['IV %'] / 100.0
-                                    if _sig > 0.001:
-                                        _c_qty = float(_row['Call'])
-                                        _p_qty = float(_row['Put'])
-                                        # Vanna: ∂Δ/∂σ — directional
-                                        _v = _b76_vanna(
-                                            _atm, _K, T_calc, _sig
-                                        )
-                                        _net_vanna += (
-                                            _v * (_c_qty - _p_qty)
-                                        )
-                                        # Volga: ∂²V/∂σ² — symmetric
-                                        # Both calls and puts contribute
-                                        _vg = _b76_volga(
-                                            _atm, _K, T_calc, _sig
-                                        )
-                                        _net_volga += (
-                                            _vg * (_c_qty + _p_qty)
-                                        )
 
                             # Estimate daily IV change from
                             # IV skew slope (OI vs Vol IV difference)
