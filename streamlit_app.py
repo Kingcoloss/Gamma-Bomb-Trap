@@ -1126,10 +1126,11 @@ if not df_intraday.empty:
         if 'anim_idx' in st.session_state and st.session_state.anim_idx < len(available_times):
             st.session_state.selected_time_state = available_times[st.session_state.anim_idx]
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         ":material/query_stats: GBT Analysis",
         ":material/show_chart: Intraday Volume",
         ":material/account_balance: Open Interest (OI)",
+        ":material/menu_book: คู่มืออ่านค่า",
     ])
 
     # ══════════════════════════════════════
@@ -2420,6 +2421,488 @@ if not df_intraday.empty:
                                 hide_index=True,
                                 use_container_width=True,
                             )
+
+    # ══════════════════════════════════════
+    # TAB 4 – คู่มืออ่านค่า (Accordion Guide)
+    # ══════════════════════════════════════
+    with tab4:
+        st.markdown("## :material/menu_book: คู่มืออ่านค่า Gamma Bomb Trap")
+        st.caption(
+            "คำอธิบายทุกค่าในแดชบอร์ด ตั้งแต่ระดับเริ่มต้นจนถึงสูตรคำนวณจริง  ·  "
+            "คลิกแถบด้านล่างเพื่อเปิดอ่าน"
+        )
+
+        # ────────────────────────────────────
+        # Section 1 — พื้นฐาน (Beginner)
+        # ────────────────────────────────────
+        st.markdown("### :material/school: พื้นฐาน — เริ่มต้นอ่าน Dashboard")
+
+        with st.expander("📌 ATM (At-The-Money) คืออะไร?"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+ATM คือ **ราคาซื้อขายปัจจุบันของ Gold Futures** ที่ดึงมาจาก Header ข้อมูล CME โดยตรง
+ค่านี้ไม่ได้ผ่านการคำนวณใด ๆ — อ่านตรงจาก data feed
+
+**วิธีอ่าน**
+- ราคาอยู่ **เหนือ ATM** → ตลาดมีแนวโน้ม Bullish
+- ราคาอยู่ **ต่ำกว่า ATM** → ตลาดมีแนวโน้ม Bearish
+- ATM เป็นจุดอ้างอิงกลางของทุก Greek ในแดชบอร์ด
+
+**ระดับกลาง**
+
+ทุก Greek (Gamma, Vanna, Volga) ถูกคำนวณจาก Black-76 Model โดยใช้ ATM เป็น **F (Futures Price)**
+ในสูตร ดังนั้นถ้า ATM เปลี่ยน ค่าทุกตัวจะเปลี่ยนตาม
+""")
+
+        with st.expander("📌 DTE (Days to Expiry) คืออะไร?"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+DTE = จำนวนวันที่เหลือก่อนที่ Options จะหมดอายุ ยิ่ง DTE น้อย Options ยิ่งไวต่อการเปลี่ยนแปลงราคา
+
+**วิธีอ่าน**
+- **DTE สูง (> 30 วัน)** → ตลาดเคลื่อนไหวช้า Theta กินทีละน้อย ช่วง Breakeven กว้าง
+- **DTE ต่ำ (< 7 วัน)** → ตลาดไวมาก Theta เร่งตัว ช่วง Breakeven แคบ Gamma ระเบิดง่าย
+- DTE ถูกดึงจาก Header ข้อมูล CME เช่นเดียวกับ ATM
+
+**ระดับกลาง**
+
+ในสูตร Black-76: `T = DTE / 365`
+T เข้าไปอยู่ในทุกสูตร Greek — เมื่อ T → 0 ค่า Gamma จะพุ่งสูงมากบริเวณ ATM (Gamma Squeeze)
+""")
+
+        with st.expander("📌 IV — Implied Volatility (Vol Settle) คืออะไร?"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+IV คือ **ความผันผวนที่ตลาดคาดการณ์ไว้** สำหรับราคา Gold Futures ในอนาคต แสดงเป็น % ต่อปี
+
+**วิธีอ่าน**
+- **IV สูง** → ตลาดคาดว่าราคาจะผันผวนมาก → Premium Options แพง
+- **IV ต่ำ** → ตลาดคาดว่าราคาจะนิ่ง → Premium Options ถูก
+- เส้นสีแดง (Vol Settle) ในกราฟแสดง IV ในแต่ละ Strike
+
+**ระดับกลาง**
+
+IV ที่ ATM (ATM IV) เป็นตัวตั้งต้นสำคัญในการคำนวณ:
+- Gamma-Theta Breakeven Range (GTBR)
+- Vanna-Volga Adjusted GTBR
+- ค่า `σ` ในทุกสูตร Black-76
+
+**Smile / Skew**: IV ไม่เท่ากันทุก Strike — มักสูงกว่าที่ OTM Puts (Fear Premium)
+""")
+
+        with st.expander("📌 Call Volume / Put Volume / Open Interest คืออะไร?"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+| ค่า | ความหมาย |
+|-----|---------|
+| **Call Volume** | จำนวน Call Options ที่ซื้อขายระหว่างวัน (Intraday) |
+| **Put Volume** | จำนวน Put Options ที่ซื้อขายระหว่างวัน |
+| **Call OI** | จำนวน Call Options ที่ยังเปิดสถานะอยู่ (End of Day) |
+| **Put OI** | จำนวน Put Options ที่ยังเปิดสถานะอยู่ |
+
+**ความแตกต่างสำคัญ**
+- **Intraday Volume** = *กิจกรรม* (ใครกำลังเทรดอะไรอยู่ตอนนี้)
+- **Open Interest** = *ตำแหน่ง* (Dealer ถือ Position อะไรอยู่บ้าง)
+
+ทั้งสองข้อมูลมาจาก CME แต่ใช้วิเคราะห์คนละมุม:
+- Volume → γ-Flow (แรงไหล)
+- OI → GEX (Gamma Exposure ของ Dealer)
+""")
+
+        # ────────────────────────────────────
+        # Section 2 — Gamma & GEX (Intermediate)
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/ssid_chart: Gamma & GEX — ระบอบตลาด")
+
+        with st.expander("🟣 GEX Flip / γ-Flow Flip — จุดเปลี่ยนระบอบตลาด"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+GEX Flip คือ **ราคาที่ตลาดเปลี่ยนพฤติกรรม** ระหว่าง "ดีดกลับ" กับ "วิ่งต่อเนื่อง"
+
+**วิธีอ่าน**
+- ราคาอยู่ **เหนือ GEX Flip** → Dealers เป็น Long Gamma → ตลาดมักดีดกลับ (Mean-Revert)
+- ราคาอยู่ **ต่ำกว่า GEX Flip** → Dealers เป็น Short Gamma → ตลาดอาจวิ่งรุนแรง (Trending)
+- ยิ่งราคาห่างจาก Flip มาก แรง Hedging ยิ่งเข้มข้น
+
+**ระดับกลาง — วิธีคำนวณ**
+
+1. คำนวณ Net GEX ทุก Strike: `Net GEX_K = Γ_B76(F,K,T,σ) × (Call_OI − Put_OI) × F² × 0.01`
+2. เรียง Strike จากต่ำไปสูง แล้วทำ Cumulative Sum
+3. หาจุดที่ Cumulative GEX **ข้ามศูนย์** (เปลี่ยนจากบวกเป็นลบ)
+4. ⚠ **เฉพาะ Strike ที่มี OI/Volume > 0 เท่านั้น** (ไม่นับ Strike ที่ว่างเปล่า)
+5. ถ้ามีหลายจุดข้ามศูนย์ → เลือกจุดที่ **ใกล้ ATM ที่สุด** (จุดที่มีนัยสำคัญทางโครงสร้าง)
+
+**ความแตกต่างระหว่าง 2 แท็บ**
+
+| แท็บ | ข้อมูล | ชื่อค่า | ความหมาย |
+|------|--------|---------|---------|
+| Intraday Volume | Volume | **γ-Flow Flip** | จุดที่ *แรงไหลของ Gamma* เปลี่ยนทิศ |
+| Open Interest | OI | **GEX Flip** | จุดที่ *ตำแหน่ง Dealer Gamma* เปลี่ยนทิศ |
+
+**ระดับสูง — Model**
+
+ใช้ **Black-76 Model** (Options on Futures, r=0):
+```
+Γ = N′(d1) / (F × σ × √T)
+d1 = [ln(F/K) + ½σ²T] / (σ√T)
+```
+""")
+
+        with st.expander("🟢 +GEX Wall / +γ-Flow Wall — แนวต้านตาม Gamma"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Strike ที่มี **Positive Net GEX สูงสุด** — เกิดจาก Call OI/Volume ที่หนาแน่น
+
+**วิธีอ่าน**
+- เมื่อราคาเข้าใกล้ +Wall → Dealers ต้อง **ซื้อ Futures กลับ** เพื่อ Delta Hedge
+- แรงซื้อนี้ทำให้ราคา **ชะลอหรือดีดกลับ**
+- ใช้เป็น **แนวต้านที่อิงจาก Gamma** (Gamma Resistance)
+
+**ระดับกลาง**
+- ยิ่ง OI/Volume หนามาก → แรงต้านยิ่งแกร่ง
+- +Wall ที่ Converge (OI ≈ Volume) → ยืนยันว่าเป็นแนวต้านที่แข็งแกร่ง
+- +Wall ที่ Diverge → แนวต้านอาจไม่แน่นอน ต้องดูข้อมูลเพิ่ม
+""")
+
+        with st.expander("🔴 −GEX Wall / −γ-Flow Wall — แนวรับตาม Gamma"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Strike ที่มี **Negative Net GEX สูงสุด** — เกิดจาก Put OI/Volume ที่หนาแน่น
+
+**วิธีอ่าน**
+- เมื่อราคาเข้าใกล้ −Wall → Dealers ต้อง **ขาย Futures** เพื่อ Delta Hedge
+- แรงขายนี้ทำให้ราคา **ชะลอหรือดีดขึ้น**
+- ใช้เป็น **แนวรับที่อิงจาก Gamma** (Gamma Support)
+
+**ระดับกลาง — สัญญาณอันตราย**
+- ถ้าราคา **หลุด −Wall** → แรงขาย Dealer จะเร่งตัว → **Sell-off รุนแรง** (Gamma Cascade)
+- เหตุผล: Dealer ต้อง Short Futures เพิ่มเรื่อย ๆ เพื่อ Hedge Put ที่เข้า ITM → วงจรป้อนกลับเชิงลบ
+""")
+
+        with st.expander("🟣 GEX Peak / γ-Flow Peak — จุดสูงสุด (เมื่อไม่มี Flip)"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+เมื่อ Cumulative GEX **ไม่ข้ามศูนย์เลย** (ไม่มี Flip) → แสดงค่า Peak แทน
+
+- Peak = Strike ที่มี |Net GEX| สูงสุด (ค่าสัมบูรณ์)
+- ใช้เป็น **จุดโครงสร้างหลัก** เมื่อตลาดอยู่ในระบอบเดียวทั้งหมด (ล้วน Long Gamma หรือล้วน Short Gamma)
+
+**ระดับกลาง**
+- ถ้า Peak เป็นบวก → ตลาดล้วน Long Gamma → Mean-Revert แรง
+- ถ้า Peak เป็นลบ → ตลาดล้วน Short Gamma → Trending แรง ระวังการเคลื่อนไหวรุนแรง
+""")
+
+        # ────────────────────────────────────
+        # Section 3 — GTBR (Intermediate-Advanced)
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/balance: Gamma-Theta Breakeven — ช่วง BE")
+
+        with st.expander("🟠 γ/θ Expiry Range — ช่วง Breakeven ตลอด DTE ที่เหลือ"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+ช่วงราคาที่ **กำไรจาก Gamma ตลอดอายุ Options = ต้นทุน Theta ทั้งหมด**
+
+**วิธีอ่าน**
+- ราคาอยู่ **ภายในช่วง** → Long Gamma ขาดทุน (Theta กินกำไร)
+- ราคา **หลุดออกนอกช่วง** → Long Gamma มีกำไร
+
+**ระดับกลาง — ที่มาสูตร**
+
+จาก Black-76 PDE ที่ ATM (r=0):
+```
+Daily P&L = ½Γ(ΔF)² + Θ·Δt
+```
+ตั้ง P&L = 0 แล้วแก้สมการ:
+```
+(ΔF)² = F² × σ² × Δt
+
+Expiry: ΔF = F × σ × √(DTE/365)
+```
+**ระดับสูง**
+- ยิ่ง DTE น้อย → ช่วงยิ่งแคบ (เพราะ Theta เร่งตัว)
+- Expiry Range แสดงภาพรวมทั้ง DTE ที่เหลือ
+- ใช้ประเมินว่า Options จะ Expire ITM หรือไม่ จากมุม Gamma-Theta
+""")
+
+        with st.expander("🟡 γ/θ Daily Range — ช่วง Breakeven รายวัน"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+ช่วงราคาที่ **กำไรจาก Gamma ต่อวัน = ต้นทุน Theta รายวัน**
+
+**วิธีอ่าน**
+- ถ้า Realized Move วันนี้ **> Daily BE** → Long Gamma ได้กำไรสุทธิในวันนั้น
+- ถ้า Realized Move **< Daily BE** → Long Gamma ขาดทุนสุทธิ
+
+**สูตร**
+```
+ΔF_daily = F × σ / √365
+```
+
+**เปรียบเทียบกับ Expiry**
+| ค่า | ใช้ตอน | Δt |
+|-----|--------|-----|
+| Expiry Range | ดูภาพรวม DTE ทั้งหมด | DTE/365 |
+| Daily Range | ตัดสินใจเทรดวันต่อวัน | 1/365 |
+""")
+
+        # ────────────────────────────────────
+        # Section 4 — Vanna & Volga (Advanced)
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/auto_graph: Vanna & Volga — Second-Order Greeks")
+
+        with st.expander("🔵 Net Vanna — Delta เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Vanna วัดว่า **Delta ของ Options เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน**
+หรือมองอีกมุม: **Vega เปลี่ยนแค่ไหนเมื่อราคา Futures เปลี่ยน**
+
+**วิธีอ่าน**
+- **Net Vanna > 0 (Bullish Shift)** → เมื่อ IV พุ่ง Dealers ต้อง Short Futures เพิ่ม → กดราคาลง → ช่วง BE เลื่อนลง
+- **Net Vanna < 0 (Bearish Shift)** → เมื่อ IV พุ่ง Dealers ต้อง Buy Futures กลับ → ดันราคาขึ้น → ช่วง BE เลื่อนขึ้น
+- ค่ายิ่งมาก → ผลกระทบต่อ Breakeven Range ยิ่งเด่นชัด
+
+**ระดับกลาง — การคำนวณ**
+```
+Net Vanna = Σ [ Vanna(F,K,T,σ) × (Call_qty − Put_qty) ]
+```
+- ใช้ (Call − Put) เพราะ Vanna มี **ทิศทาง** (directional)
+- Call OTM มี Vanna > 0 / Put OTM มี Vanna < 0
+
+**ระดับสูง — สูตร Black-76**
+```
+Vanna = −N′(d1) × d2 / σ
+d2 = d1 − σ√T
+```
+
+**ผลต่อ PnL Attribution (Carr & Wu 2020)**
+```
+Vanna PnL = Vanna × ΔS × ΔI
+```
+- ΔS = การเปลี่ยนแปลงราคา Futures
+- ΔI = การเปลี่ยนแปลง IV
+- เป็น cross-derivative → ไม่มีสัมประสิทธิ์ ½
+
+**ตัวอย่างสถานการณ์จริง**
+
+🔻 *ตลาดร่วง + IV พุ่ง + Net Vanna สูง*:
+Vanna × (−ΔS) × (+ΔI) = **ขาดทุนเพิ่มจาก Vanna** → เป็น "เชื้อเพลิงลับ" ที่ทำให้ Crash รุนแรงขึ้น
+""")
+
+        with st.expander("🟣 Net Volga (Vomma) — Vega เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Volga วัดว่า **Vega เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน** — เป็น "Vol of Vol" sensitivity
+
+**วิธีอ่าน**
+- **Net Volga > 0 (Widen BE)** → เมื่อ IV เปลี่ยน ช่วง Breakeven จะ **กว้างขึ้น** ทั้งสองด้าน
+- **Net Volga < 0 (Narrow BE)** → ช่วง Breakeven จะ **แคบลง**
+- Volga > 0 เสมอสำหรับทุก Options (Convex in Vol)
+
+**ระดับกลาง — การคำนวณ**
+```
+Net Volga = Σ [ Volga(F,K,T,σ) × (Call_qty + Put_qty) ]
+```
+- ใช้ (Call + Put) เพราะ Volga เป็น **symmetric** — ทั้ง Call และ Put มีส่วนเท่ากัน
+- ค่า Volga สูงสุดบริเวณ ATM
+
+**ระดับสูง — สูตร Black-76**
+```
+Volga = Vega × (d1 × d2) / σ
+Vega = F × N′(d1) × √T
+```
+
+**ผลต่อ PnL Attribution (Carr & Wu 2020)**
+```
+Volga PnL = ½ × Volga × (ΔI)²
+```
+- สัมประสิทธิ์ ½ เพราะเป็น pure second-order term
+- (ΔI)² เสมอบวก → ทิศทางขึ้นกับเครื่องหมาย Volga
+
+**Shadow Vega — สถานการณ์อันตราย**
+
+🔻 *Short Vega + High Volga + IV Spike*:
+```
+Volga PnL = ½ × (+Volga) × (+ΔI)² = ขาดทุนเพิ่มแบบทวีคูณ
+```
+นี่คือ "Shadow Vega" — การขาดทุนที่ซ่อนอยู่ใน Volga ซึ่งไม่เห็นจาก Vega อย่างเดียว
+เพราะเมื่อ IV พุ่ง Vega เองก็พุ่งตาม (Volga effect) ทำให้ขาดทุนเร่งตัวแบบ exponential
+""")
+
+        with st.expander("🔷 ΔIV Proxy — ค่าประมาณการเปลี่ยนแปลง IV"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+ΔIV Proxy คือ **ค่าประมาณว่า IV จะเปลี่ยนไปเท่าไหร่** ใช้เป็น input สำหรับ Vanna-Volga Adjusted GTBR
+
+**วิธีคำนวณ**
+```
+ΔIV = IV_Intraday − IV_OI
+```
+- IV Intraday = ATM IV จากข้อมูล Volume ล่าสุด (ราคาที่เทรดอยู่ตอนนี้)
+- IV OI = ATM IV จากข้อมูล Open Interest (ราคาปิดวันก่อน)
+- ผลต่าง = ทิศทางและขนาดที่ IV กำลังเปลี่ยน
+
+**วิธีอ่าน**
+- **ΔIV > 0** → IV กำลังเพิ่มขึ้น (ตลาดกังวลมากขึ้น)
+- **ΔIV < 0** → IV กำลังลดลง (ตลาดสงบลง)
+- **ΔIV ≈ 0** → IV คงที่ → Vanna/Volga ไม่มีผลต่อ BE
+""")
+
+        # ────────────────────────────────────
+        # Section 5 — Vanna-Volga GTBR (Pro)
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/science: Vanna-Volga Adjusted GTBR — สูตรเต็ม Carr & Wu")
+
+        with st.expander("🔹 V-GTBR Daily / Expiry — ช่วง BE ปรับด้วย Vanna + Volga"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+V-GTBR คือ Gamma-Theta Breakeven Range ที่ **ปรับเพิ่มผลกระทบจาก Vanna และ Volga**
+ให้สมจริงกว่า GTBR มาตรฐานที่สมมติว่า IV ไม่เปลี่ยน
+
+**วิธีอ่าน**
+- **Shift ≠ 0** → ช่วง BE เลื่อนไม่สมมาตร (ผล Vanna) — ดูค่า "shift" ใต้ตัวเลข
+- ช่วง **กว้างกว่า GTBR ปกติ** → Volga ขยาย BE (ตลาดมีความเสี่ยงสูงกว่าที่ Gamma-Theta บอก)
+- ช่วง **แคบกว่า GTBR ปกติ** → Volga หด BE
+
+**ระดับสูง — Full PnL Attribution (Carr & Wu 2020)**
+
+สมการ PnL ของ delta-hedged portfolio:
+```
+dPnL = θ·dt + ½Γ(ΔF)² + Vanna·(ΔF)(Δσ) + ½Volga·(Δσ)²
+```
+ตั้ง PnL = 0 แล้วจัดรูปเป็น quadratic ใน ΔF:
+```
+a·(ΔF)² + b·(ΔF) + c = 0
+
+a = ½ × Γ_ATM                    (Gamma coefficient)
+b = Net_Vanna × Δσ               (cross-term, ไม่มี ½)
+c = θ/365 + ½ × Net_Volga × (Δσ)²   (Theta + Volga)
+```
+แก้ด้วยสูตร quadratic:
+```
+ΔF = [−b ± √(b² − 4ac)] / 2a
+```
+- **Vanna** (b term) → เลื่อนช่วง BE ไม่สมมาตร (shift)
+- **Volga** (c term) → ขยาย/หดช่วง BE สมมาตรทั้งสองด้าน
+
+**กรณีพิเศษ**
+- เมื่อ Δσ = 0 → b = 0, Volga = 0 → ลดรูปเป็น GTBR มาตรฐาน
+- เมื่อ discriminant < 0 → ไม่มีจุดคุ้มทุน → ใช้ GTBR มาตรฐานแทน
+""")
+
+        # ────────────────────────────────────
+        # Section 6 — GBT Composite (Pro)
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/compare_arrows: GBT Composite Analysis — วิเคราะห์รวม")
+
+        with st.expander("🔀 Composite Score — คะแนนรวม OI + Volume"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Composite Score คือ **การรวมข้อมูล GEX จาก OI และ γ-Flow จาก Volume เข้าด้วยกัน**
+เพื่อดูภาพรวมว่า "ทั้งตำแหน่ง Dealer + แรงไหลวันนี้" ชี้ไปทางเดียวกันหรือไม่
+
+**วิธีอ่าน**
+- **Composite Flip** — จุดที่ทั้ง OI + Volume ชี้ว่าระบอบตลาดเปลี่ยน
+- **+Wall / −Wall Converged** → OI กับ Volume ชี้ที่เดียวกัน = สัญญาณแข็งแกร่ง
+- **+Wall / −Wall Diverged** → OI กับ Volume ชี้คนละที่ = สัญญาณไม่แน่นอน
+
+**ระดับกลาง — Regime**
+- **LONG γ — Mean-Revert**: Composite Net > 0 → Dealer ล้วน Long Gamma → ตลาดดีดกลับ
+- **SHORT γ — Trend-Follow**: Composite Net < 0 → Dealer ล้วน Short Gamma → ตลาดวิ่งต่อ
+
+**Block Count**: จำนวน Strike ที่มี OI/Volume หนาทั้งสองฝั่ง (Call & Put) → ยิ่งมาก ยิ่ง "ล็อค" ราคาไว้
+""")
+
+        with st.expander("✅ Convergence — สัญญาณยืนยัน"):
+            st.markdown("""
+**ระดับเริ่มต้น**
+
+Convergence ตรวจว่า **Wall จาก OI กับ Wall จาก Volume อยู่ใกล้กันหรือไม่**
+
+**วิธีอ่าน**
+- ✅ **Converged** (ห่างกัน ≤ 25 จุด) → แนวรับ/ต้านน่าเชื่อถือสูง
+- ⚠ **Diverged** (ห่างกัน > 25 จุด) → แนวรับ/ต้านอาจไม่แม่น ตลาดยังไม่ตกลงกัน
+
+**ระดับกลาง — เหตุผล**
+- OI = Position เก่า (สะสมมาหลายวัน)
+- Volume = กิจกรรมใหม่ (วันนี้)
+- ถ้าทั้งสองชี้ที่เดียวกัน → ตลาดทั้งเก่าและใหม่เห็นตรงกัน = **high conviction**
+""")
+
+        # ────────────────────────────────────
+        # Section 7 — Trading Application
+        # ────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### :material/strategy: การนำไปใช้เทรด — ตัวอย่างสถานการณ์")
+
+        with st.expander("📖 สถานการณ์ที่ 1: ราคาอยู่เหนือ GEX Flip + Long Gamma Regime"):
+            st.markdown("""
+**สภาพตลาด**: ราคา > GEX Flip, Composite Net > 0, ΔIV ≈ 0
+
+**การตีความ**
+- Dealers เป็น Long Gamma → ทุกครั้งที่ราคาขึ้น Dealers ขาย / ราคาลง Dealers ซื้อ
+- ตลาดจะ **ดีดกลับ** เข้าหา GEX Flip → เทรด **Mean-Revert** (ขายเมื่อขึ้นถึง +Wall, ซื้อเมื่อลงถึง Flip)
+- Vanna/Volga ไม่มีผลมากเพราะ ΔIV ≈ 0
+
+**สิ่งที่ต้องระวัง**
+- ถ้าราคาหลุด +Wall ขึ้นไปอีก → อาจเกิด Gamma Squeeze (Short Squeeze ด้านบน)
+""")
+
+        with st.expander("📖 สถานการณ์ที่ 2: ราคาหลุด −Wall + IV Spike + Vanna สูง"):
+            st.markdown("""
+**สภาพตลาด**: ราคา < −Wall, ΔIV > 0, Net Vanna สูง
+
+**การตีความ**
+- Dealers เป็น Short Gamma → ต้องขาย Futures ตามทิศทาง → เร่ง Sell-off
+- IV พุ่ง → Vanna ทำให้ Delta เปลี่ยนเพิ่ม → Dealers ต้อง Hedge เพิ่มอีก
+- V-GTBR จะ **Shift ลง + กว้างขึ้น** → ราคามีโอกาสลงไปอีกไกล
+
+**สิ่งที่ต้องระวัง**
+- นี่คือ **Gamma Cascade** — วงจรป้อนกลับเชิงลบ
+- Shadow Vega (Volga) จะเร่งการขาดทุนแบบ exponential
+- ไม่ควร Catch Bottom จนกว่า IV จะเริ่มลด + ราคากลับเหนือ −Wall
+""")
+
+        with st.expander("📖 สถานการณ์ที่ 3: Walls Converged + DTE ต่ำ"):
+            st.markdown("""
+**สภาพตลาด**: +Wall OI ≈ +Wall Volume, −Wall OI ≈ −Wall Volume, DTE < 7
+
+**การตีความ**
+- Walls ยืนยันแล้ว (Converged) → แนวรับ/ต้านแข็งแกร่ง
+- DTE ต่ำ → Gamma สูงมาก → ราคาจะ "ติด" อยู่ในช่วง Walls
+- Daily BE แคบมาก → แม้เคลื่อนไหวเล็กน้อยก็ Breakeven ได้
+
+**กลยุทธ์ที่เหมาะ**
+- เทรด Range: ซื้อที่ −Wall, ขายที่ +Wall
+- หรือ Short Straddle/Strangle ถ้ามั่นใจว่าราคาจะไม่หลุดช่วง
+- ⚠ ระวัง: ถ้าราคาหลุด Wall ใดก็ตาม → การเคลื่อนไหวจะรุนแรงมาก (DTE ต่ำ + High Gamma)
+""")
+
+        st.markdown("---")
+        st.caption(
+            "📐 ข้อมูลทั้งหมดคำนวณด้วย **Black-76 Model** (Options on Futures, r=0)  ·  "
+            "แหล่งข้อมูล: CME Group  ·  "
+            "อ้างอิงสูตร: Carr & Wu (2020), Bossu et al. (2005), Silic & Poulsen (2021)"
+        )
 
 # ==========================================
 # ─── Auto-Refresh Engine ───
