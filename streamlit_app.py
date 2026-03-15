@@ -23,9 +23,9 @@ import concurrent.futures
 # ==========================================
 
 try:
-GITHUB_TOKEN = st.secrets[“github”][“access_token”]
+ GITHUB_TOKEN = st.secrets[“github”][“access_token”]
 except:
-GITHUB_TOKEN = “”
+ GITHUB_TOKEN = “”
 
 # ==========================================
 
