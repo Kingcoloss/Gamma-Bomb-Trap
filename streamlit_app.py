@@ -1092,15 +1092,15 @@ if not df_intraday.empty:
             st.session_state.selected_time_state = available_times[st.session_state.anim_idx]
 
     tab1, tab2, tab3 = st.tabs([
+        ":material/query_stats: GBT Analysis",
         ":material/show_chart: Intraday Volume",
         ":material/account_balance: Open Interest (OI)",
-        ":material/query_stats: GBT Analysis",
     ])
 
     # ══════════════════════════════════════
     # TAB 1 – Intraday Volume
     # ══════════════════════════════════════
-    with tab1:
+    with tab2:
         time_val   = st.session_state.selected_time_state
         frame_data = (
             df_intraday[df_intraday['Time'] == time_val]
@@ -1370,7 +1370,7 @@ if not df_intraday.empty:
     # ══════════════════════════════════════
     # TAB 2 – Open Interest
     # ══════════════════════════════════════
-    with tab2:
+    with tab3:
         if not df_oi.empty:
             latest_oi = (
                 df_oi[df_oi['Datetime'] == df_oi['Datetime'].max()]
@@ -1615,7 +1615,7 @@ if not df_intraday.empty:
     # 6. Block detection:
     #    |γ-Flow_K / GEX_OI_K| ≥ threshold → institutional block print
     # ══════════════════════════════════════════════════════════════════
-    with tab3:
+    with tab1:
         if df_oi.empty or df_intraday.empty:
             st.warning(
                 "⚠ ต้องมีข้อมูลทั้ง **Intraday Volume** และ **Open Interest** "
