@@ -170,3 +170,7 @@ cython_debug/
 .github/instructions/codacy.instructions.md
 
 documents/
+
+.codacy/
+.idea/
+.claude/
