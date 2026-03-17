@@ -18,6 +18,10 @@ class GexResult:
     peak: Optional[float] = None
     net_vanna_total: float = 0.0
     net_volga_total: float = 0.0
+    # Aggregate Greeks for internally-consistent Vanna-Volga GTBR quadratic
+    # (Carr & Wu 2020): Σ Γ×(Call−Put) and Σ θ×(Call−Put) across all strikes
+    net_gamma_total: float = 0.0
+    net_theta_total: float = 0.0
 
 
 @dataclass

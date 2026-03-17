@@ -39,6 +39,8 @@ def calculate_gamma_theta_breakeven(
 def calculate_vanna_adjusted_gtbr(
     F: float, atm_iv: float, dte: float,
     net_vanna: float, net_volga: float, delta_iv: float,
+    net_gamma: float | None = None,
+    net_theta: float | None = None,
 ) -> VannaVolgaGtbrResult:
     """
     Vanna + Volga Adjusted Gamma-Theta Breakeven Range.
@@ -61,31 +63,29 @@ def calculate_vanna_adjusted_gtbr(
       b = Vanna · Δσ               (cross-derivative, no ½)
       c = θ/365 + ½ · Volga · (Δσ)²
 
-    Mixed-Greeks Design Rationale
-    ------------------------------
-    gamma_atm and theta_atm are intentionally ATM-local (Black-76 at K=F).
-    For near-expiry Gold futures options the ATM strike dominates the
-    breakeven condition; off-ATM Gamma/Theta contribute negligibly and
-    would dilute the signal if aggregated.
+    Aggregate Greeks (net_gamma, net_theta):
+    ----------------------------------------
+    When net_gamma and net_theta are provided (from GexResult.net_gamma_total /
+    net_theta_total), all four quadratic coefficients use portfolio-aggregate
+    values — internally consistent per Carr & Wu (2020):
+        a = ½ · net_gamma_total          (aggregate, directional)
+        b = net_vanna_total · Δσ         (aggregate, directional)
+        c = net_theta_total/365 + ½ · net_volga_total · (Δσ)²
 
-    net_vanna and net_volga are intentionally portfolio-aggregate
-    (Σ over all active strikes from GexResult.net_vanna_total /
-    net_volga_total).  Vanna and Volga represent the book's sensitivity
-    to changes in implied vol across the full strike distribution.
-    A portfolio long vol in the wings but short ATM has near-zero ATM
-    Vanna yet significant aggregate skew sensitivity — aggregate values
-    capture this.
-
-    This follows the Carr & Wu (2020) decomposition: ATM convexity
-    dominates PnL; vol-sensitivity adjustment uses the full book.
+    Falls back to ATM-local Gamma/Theta when not provided (legacy behaviour).
     """
     T = max(dte / 365.0, 1e-10)
 
-    # ATM Greeks (r=0, Black-76)
-    gamma_atm = b76_gamma(F, F, T, atm_iv)
-    theta_atm = b76_theta_atm(F, atm_iv, T)
+    # Prefer aggregate Greeks for internal consistency (Carr & Wu 2020).
+    # Fall back to ATM-local when aggregate not available.
+    if net_gamma is not None and net_gamma != 0.0:
+        gamma_used = net_gamma
+        theta_used = net_theta if net_theta is not None else b76_theta_atm(F, atm_iv, T)
+    else:
+        gamma_used = b76_gamma(F, F, T, atm_iv)
+        theta_used = b76_theta_atm(F, atm_iv, T)
 
-    if gamma_atm == 0:
+    if gamma_used == 0:
         d_exp = F * atm_iv * math.sqrt(T)
         d_day = F * atm_iv / math.sqrt(365.0)
         return VannaVolgaGtbrResult(
@@ -95,10 +95,10 @@ def calculate_vanna_adjusted_gtbr(
         )
 
     # Daily (Δt = 1/365)
-    theta_daily = theta_atm / 365.0
+    theta_daily = theta_used / 365.0
     volga_pnl_daily = 0.5 * net_volga * delta_iv * delta_iv
 
-    a_d = 0.5 * gamma_atm
+    a_d = 0.5 * gamma_used
     b_d = net_vanna * delta_iv
     c_d = theta_daily + volga_pnl_daily
 
@@ -117,11 +117,11 @@ def calculate_vanna_adjusted_gtbr(
         shift_d = (lo_d + hi_d) / 2.0 - F
 
     # Expiry (Δt = T)
-    theta_expiry = theta_atm * T
-    delta_iv_expiry = delta_iv * math.sqrt(dte) if dte > 0 else 0.0
+    theta_expiry = theta_used * T
+    delta_iv_expiry = delta_iv * math.sqrt(dte / 365.0) if dte > 0 else 0.0
     volga_pnl_expiry = 0.5 * net_volga * delta_iv_expiry * delta_iv_expiry
 
-    a_e = 0.5 * gamma_atm
+    a_e = 0.5 * gamma_used
     b_e = net_vanna * delta_iv_expiry
     c_e = theta_expiry + volga_pnl_expiry
 

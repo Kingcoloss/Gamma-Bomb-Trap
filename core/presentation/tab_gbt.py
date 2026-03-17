@@ -118,7 +118,7 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
 
     _gf_o = _pw_o = _nw_o = _pk_o = None
     _gdf_o = None
-    _nva_o = _nvg_o = 0.0
+    _nva_o = _nvg_o = _nga_o = _nta_o = 0.0
     if _iv_o:
         result_o = calculate_gex_analysis(_oi_snap, _atm, _dte, "OI")
         _gf_o = result_o.flip
@@ -128,6 +128,8 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         _pk_o = result_o.peak
         _nva_o = result_o.net_vanna_total
         _nvg_o = result_o.net_volga_total
+        _nga_o = result_o.net_gamma_total
+        _nta_o = result_o.net_theta_total
 
     # ── Build composite per-strike table ──
     _rows = []
@@ -196,6 +198,15 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         if _all_comp_crossings else None
     )
 
+    # Mean of all crossings — informational display only (shown in metric delta).
+    # SD table centers on the LOWEST composite flip crossing (nearest structural
+    # gamma-neutral level below ATM). Falls back to ATM when no crossings exist.
+    _mean_flip = (
+        sum(_all_comp_crossings) / len(_all_comp_crossings)
+        if len(_all_comp_crossings) > 1 else None
+    )
+    _sd_center = min(_all_comp_crossings) if _all_comp_crossings else _atm
+
     # ── Composite Walls ──
     _c_pw = (
         _cdf.loc[_cdf['Composite'].idxmax(), 'Strike']
@@ -238,10 +249,13 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             _raw_delta_iv = _iv_v - _iv_o
             _delta_iv = max(-DELTA_IV_CAP, min(DELTA_IV_CAP, _raw_delta_iv))
 
-        # Vanna + Volga Adjusted GTBR
+        # Vanna + Volga Adjusted GTBR — use aggregate Gamma/Theta for
+        # internal consistency per Carr & Wu (2020) (issue #4 fix)
         vgtbr_result = calculate_vanna_adjusted_gtbr(
             _atm, _iv_comp, _dte,
             _net_vanna, _net_volga, _delta_iv,
+            net_gamma=_nga_o or None,
+            net_theta=_nta_o or None,
         )
         _va_ld = vgtbr_result.lo_daily
         _va_hd = vgtbr_result.hi_daily
@@ -249,6 +263,14 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         _va_he = vgtbr_result.hi_expiry
         _v_shift_d = vgtbr_result.shift_daily
         _v_shift_e = vgtbr_result.shift_expiry
+
+    # ── Pre-compute sigma + DGC (shared by chart and σ-Range tables) ──
+    # Defined here so chart can use them before the σ-Range table section.
+    _sigma_d = _atm * _iv_comp / math.sqrt(365) if _iv_comp and _dte > 0 else 0.0
+    _sigma_e = _atm * _iv_comp * math.sqrt(_dte / 365) if _iv_comp and _dte > 0 else 0.0
+    # DGC = midpoint of V-GTBR daily range = vertex of Carr & Wu P&L parabola
+    # = F − (Net_Vanna × ΔIV) / Net_Gamma  (only valid when V-GTBR solved successfully)
+    _dgc = (_va_ld + _va_hd) / 2.0 if _va_ld and _va_hd else None
 
     # ── Block count ──
     _n_blocks = int(_cdf['Block'].sum())
@@ -278,6 +300,151 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 f"OI {_nw_o:.0f} vs Vol {_nw_v:.0f}"
             )
 
+    # ── SD Range controls (center + range type) ──
+    _ctrl_col1, _ctrl_col2 = st.columns(2)
+
+    with _ctrl_col1:
+        _sd_opts = ["📊 Lowest Flip / ATM — Probability Center"]
+        if _dgc is not None:
+            _sd_opts.append("📌 DGC — Dealer Gravity Center (Behavioral)")
+        _sd_mode = st.selectbox(
+
+            "📐 SD Center — จุดศูนย์กลาง",
+            _sd_opts,
+            key="gbt_sd_mode",
+            help=(
+                "Probability Center: Lowest Composite Flip (หรือ ATM) "
+                "— บอกว่าราคา 'น่าจะ' ไปถึงไหน  |  "
+                "DGC: V-GTBR Midpoint "
+                "— บอกว่า Dealer 'พยายามจะตรึง' ราคาไว้ที่ไหน"
+            ),
+        )
+
+    with _ctrl_col2:
+        # Build range options dynamically — V-GTBR options only when solved
+        _range_opts = ["📏 GTBR Daily  (F×σ/√365)"]
+        if _va_ld and _va_hd:
+            _range_opts.append("🔹 V-GTBR Daily  (Vanna-Volga adj.)")
+        _range_opts.append("📏 GTBR Expiry  (F×σ×√T)")
+        if _va_le and _va_he:
+            _range_opts.append("🔹 V-GTBR Expiry  (Vanna-Volga adj.)")
+        _range_mode = st.selectbox(
+            "📏 SD Range — ขนาด 1σ",
+            _range_opts,
+            key="gbt_range_mode",
+            help=(
+                "GTBR Daily/Expiry: Black-76 symmetric sigma  |  "
+                "V-GTBR Daily/Expiry: ใช้ครึ่งหนึ่งของ Vanna-Volga Kill Zone "
+                "เป็น 1σ — สะท้อนขีดจำกัดความอดทนจริงของ Dealer"
+            ),
+        )
+
+    # Resolve σ band size from selected range
+    _use_dgc = _dgc is not None and "DGC" in _sd_mode
+    _chart_center = _dgc if _use_dgc else _sd_center
+
+    if "V-GTBR Daily" in _range_mode and _va_ld and _va_hd:
+        _sigma_band = (_va_hd - _va_ld) / 2.0
+        _range_label = "V-1D"
+    elif "V-GTBR Expiry" in _range_mode and _va_le and _va_he:
+        _sigma_band = (_va_he - _va_le) / 2.0
+        _range_label = "V-Exp"
+    elif "Expiry" in _range_mode:
+        _sigma_band = _sigma_e
+        _range_label = "Exp"
+    else:
+        _sigma_band = _sigma_d
+        _range_label = "1D"
+
+    # Band colors: purple for probability, gold for DGC
+    _band_color_1s = "rgba(139,92,246,0.14)" if not _use_dgc else "rgba(251,191,36,0.14)"
+    _band_color_2s = "rgba(139,92,246,0.06)" if not _use_dgc else "rgba(251,191,36,0.06)"
+    _center_line_color = "#A855F7" if not _use_dgc else "#FBBF24"
+
+    # ═════════════════════════════════════
+    #  DATA CARD: GEX & GTBR Key Levels
+    # ═════════════════════════════════════
+    st.markdown("---")
+    st.markdown(
+        "### :material/analytics: "
+        "GEX & GTBR — Key Levels"
+    )
+
+    def _card(title, value, sub="", border_color="rgba(255,255,255,0.15)"):
+        return (
+            f"<div style='padding:10px 14px;border-radius:8px;"
+            f"background:rgba(255,255,255,0.03);"
+            f"border:1px solid {border_color};"
+            f"text-align:center;min-height:90px'>"
+            f"<div style='font-size:11px;color:gray;font-weight:600;"
+            f"text-transform:uppercase;letter-spacing:0.5px'>{title}</div>"
+            f"<div style='font-size:18px;font-weight:700;color:white;"
+            f"margin:4px 0 2px'>{value}</div>"
+            f"<div style='font-size:11px;color:gray'>{sub}</div>"
+            f"</div>"
+        )
+
+    _dc1, _dc2, _dc3, _dc4, _dc5 = st.columns(5)
+    with _dc1:
+        st.markdown(_card(
+            "ATM",
+            f"{_atm:,.1f}",
+            (f"IV {_iv_comp*100:.1f}% · DTE {_dte:.1f}"
+             if _iv_comp else f"DTE {_dte:.1f}"),
+            "rgba(136,136,136,0.4)",
+        ), unsafe_allow_html=True)
+    with _dc2:
+        _flip_str = f"{_c_flip:,.1f}" if _c_flip else "N/A"
+        _cross_n = len(_all_comp_crossings)
+        st.markdown(_card(
+            "Composite Flip",
+            _flip_str,
+            f"{_cross_n} crossing{'s' if _cross_n != 1 else ''}",
+            "rgba(168,85,247,0.4)",
+        ), unsafe_allow_html=True)
+    with _dc3:
+        _wall_str = "—"
+        if _c_pw and _c_nw:
+            _wall_str = f"{_c_nw:,.0f} — {_c_pw:,.0f}"
+        elif _c_pw:
+            _wall_str = f"— / {_c_pw:,.0f}"
+        elif _c_nw:
+            _wall_str = f"{_c_nw:,.0f} / —"
+        st.markdown(_card(
+            "−Wall / +Wall",
+            _wall_str,
+            "Support — Resistance",
+            "rgba(34,197,94,0.3)",
+        ), unsafe_allow_html=True)
+    with _dc4:
+        if _ld and _hd:
+            st.markdown(_card(
+                "GTBR Daily",
+                f"{_ld:,.0f} — {_hd:,.0f}",
+                (f"Exp: {_le:,.0f}—{_he:,.0f}"
+                 if _le and _he else ""),
+                "rgba(251,146,60,0.3)",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(_card(
+                "GTBR", "N/A", "",
+                "rgba(251,146,60,0.2)",
+            ), unsafe_allow_html=True)
+    with _dc5:
+        if _va_ld and _va_hd:
+            st.markdown(_card(
+                "V-GTBR Daily",
+                f"{_va_ld:,.0f} — {_va_hd:,.0f}",
+                (f"Exp: {_va_le:,.0f}—{_va_he:,.0f}"
+                 if _va_le and _va_he else ""),
+                "rgba(6,182,212,0.3)",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(_card(
+                "V-GTBR", "N/A", "",
+                "rgba(6,182,212,0.2)",
+            ), unsafe_allow_html=True)
+
     # ═════════════════════════════════════
     #  CHART: 2-row subplot
     # ═════════════════════════════════════
@@ -285,11 +452,11 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         rows=2, cols=1,
         shared_xaxes=True,
         row_heights=[0.65, 0.35],
-        vertical_spacing=0.06,
+        vertical_spacing=0.10,
         subplot_titles=(
             "Composite GEX per Strike",
             "Cumulative Composite GEX",
-        ),
+        )
     )
 
     # Row 1 — bars + composite line
@@ -350,127 +517,197 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         fillcolor='rgba(168,85,247,0.15)',
     ), row=2, col=1)
 
-    # ── Reference lines on both rows ──
+    # ── Compute y-ranges for toggleable reference line traces ──
+    _y1_vals = (
+        list(_cdf['GEX_OI']) + list(_cdf['γ_Flow'])
+        + list(_cdf['Composite'])
+    )
+    _y1_min, _y1_max = min(_y1_vals), max(_y1_vals)
+    _y1_pad = (_y1_max - _y1_min) * 0.15
+    _y2_vals = list(_cdf['Cumulative'])
+    _y2_min, _y2_max = min(_y2_vals), max(_y2_vals)
+    _y2_pad = (_y2_max - _y2_min) * 0.15
+    _yranges = {
+        1: (_y1_min - _y1_pad, _y1_max + _y1_pad),
+        2: (_y2_min - _y2_pad, _y2_max + _y2_pad),
+    }
+
+    # ── Reference lines + SD bands on both rows ──
     for _r in [1, 2]:
-        _fig.add_vline(
-            x=_atm, line_dash="dash",
-            line_color="#888", opacity=0.8,
-            row=_r, col=1,
-            annotation_text="ATM" if _r == 1 else None,
-            annotation_position="top",
-        )
+        # σ-Range rectangles (drawn first so they sit behind all lines)
+        if _sigma_band > 0:
+            _fig.add_vrect(
+                x0=_chart_center - 2 * _sigma_band,
+                x1=_chart_center + 2 * _sigma_band,
+                fillcolor=_band_color_2s, line_width=0, layer="below",
+                row=_r, col=1,
+                annotation_text=f"2σ ({_range_label})" if _r == 1 else None,
+                annotation_position="top left",
+                annotation_font=dict(color=_center_line_color, size=8),
+            )
+            _fig.add_vrect(
+                x0=_chart_center - _sigma_band,
+                x1=_chart_center + _sigma_band,
+                fillcolor=_band_color_1s, line_width=0, layer="below",
+                row=_r, col=1,
+                annotation_text=f"1σ ({_range_label})" if _r == 1 else None,
+                annotation_position="top left",
+                annotation_font=dict(color=_center_line_color, size=8),
+            )
+            # Center line (toggleable via legend)
+            _fig.add_trace(go.Scatter(
+                x=[_chart_center, _chart_center],
+                y=[_yranges[_r][0], _yranges[_r][1]],
+                mode='lines',
+                name="DGC" if _use_dgc else "SD Center",
+                line=dict(
+                    color=_center_line_color,
+                    dash="longdash", width=1.5,
+                ),
+                opacity=0.7,
+                showlegend=(_r == 1),
+                legendgroup="sd_center",
+                hoverinfo='name+x',
+            ), row=_r, col=1)
+        # ── Toggleable reference lines (click legend to hide) ──
+        _fig.add_trace(go.Scatter(
+            x=[_atm, _atm],
+            y=[_yranges[_r][0], _yranges[_r][1]],
+            mode='lines',
+            name='ATM',
+            line=dict(color='#888888', dash='dash', width=1.5),
+            opacity=0.8,
+            showlegend=(_r == 1),
+            legendgroup='atm',
+            hoverinfo='name+x',
+        ), row=_r, col=1)
         if _le and _he:
             for _xv, _lb in [
                 (_le, "GTBR↓"), (_he, "GTBR↑"),
             ]:
-                _fig.add_vline(
-                    x=_xv, line_dash="dash",
-                    line_color="#FB923C",
-                    line_width=2, opacity=0.85,
-                    row=_r, col=1,
-                    annotation_text=(
-                        _lb if _r == 1 else None
+                _fig.add_trace(go.Scatter(
+                    x=[_xv, _xv],
+                    y=[_yranges[_r][0], _yranges[_r][1]],
+                    mode='lines',
+                    name='GTBR Exp',
+                    line=dict(
+                        color='#FB923C', dash='dash', width=2,
                     ),
-                    annotation_font=dict(
-                        color="#FB923C", size=9),
-                )
+                    opacity=0.85,
+                    showlegend=(_r == 1 and _lb == "GTBR↓"),
+                    legendgroup='gtbr_exp',
+                    hoverinfo='name+x',
+                ), row=_r, col=1)
         if _ld and _hd:
             for _xv, _lb in [
                 (_ld, "1D↓"), (_hd, "1D↑"),
             ]:
-                _fig.add_vline(
-                    x=_xv, line_dash="dot",
-                    line_color="#FCD34D",
-                    line_width=1.5, opacity=0.7,
-                    row=_r, col=1,
-                    annotation_text=(
-                        _lb if _r == 1 else None
+                _fig.add_trace(go.Scatter(
+                    x=[_xv, _xv],
+                    y=[_yranges[_r][0], _yranges[_r][1]],
+                    mode='lines',
+                    name='GTBR 1D',
+                    line=dict(
+                        color='#FCD34D', dash='dot', width=1.5,
                     ),
-                    annotation_font=dict(
-                        color="#FCD34D", size=8),
-                )
+                    opacity=0.7,
+                    showlegend=(_r == 1 and _lb == "1D↓"),
+                    legendgroup='gtbr_1d',
+                    hoverinfo='name+x',
+                ), row=_r, col=1)
         # ── Vanna-Adjusted GTBR (cyan/teal) ──
         if _va_le and _va_he:
             for _xv, _lb in [
                 (_va_le, "V-GTBR↓"),
                 (_va_he, "V-GTBR↑"),
             ]:
-                _fig.add_vline(
-                    x=_xv, line_dash="dashdot",
-                    line_color="#06B6D4",
-                    line_width=2, opacity=0.8,
-                    row=_r, col=1,
-                    annotation_text=(
-                        _lb if _r == 1 else None
+                _fig.add_trace(go.Scatter(
+                    x=[_xv, _xv],
+                    y=[_yranges[_r][0], _yranges[_r][1]],
+                    mode='lines',
+                    name='V-GTBR Exp',
+                    line=dict(
+                        color='#06B6D4', dash='dashdot', width=2,
                     ),
-                    annotation_font=dict(
-                        color="#06B6D4", size=9),
-                )
+                    opacity=0.8,
+                    showlegend=(_r == 1 and _lb == "V-GTBR↓"),
+                    legendgroup='vgtbr_exp',
+                    hoverinfo='name+x',
+                ), row=_r, col=1)
         if _va_ld and _va_hd:
             for _xv, _lb in [
                 (_va_ld, "V-1D↓"),
                 (_va_hd, "V-1D↑"),
             ]:
-                _fig.add_vline(
-                    x=_xv, line_dash="dot",
-                    line_color="#2DD4BF",
-                    line_width=1.5, opacity=0.65,
-                    row=_r, col=1,
-                    annotation_text=(
-                        _lb if _r == 1 else None
+                _fig.add_trace(go.Scatter(
+                    x=[_xv, _xv],
+                    y=[_yranges[_r][0], _yranges[_r][1]],
+                    mode='lines',
+                    name='V-GTBR 1D',
+                    line=dict(
+                        color='#2DD4BF', dash='dot', width=1.5,
                     ),
-                    annotation_font=dict(
-                        color="#2DD4BF", size=8),
-                )
+                    opacity=0.65,
+                    showlegend=(_r == 1 and _lb == "V-1D↓"),
+                    legendgroup='vgtbr_1d',
+                    hoverinfo='name+x',
+                ), row=_r, col=1)
         if _c_flip:
-            _fig.add_vline(
-                x=_c_flip, line_dash="dot",
-                line_color="#A855F7",
-                line_width=2, opacity=0.9,
-                row=_r, col=1,
-                annotation_text=(
-                    "Flip" if _r == 2 else None
-                ),
-                annotation_font=dict(
-                    color="#A855F7", size=10),
-            )
+            _fig.add_trace(go.Scatter(
+                x=[_c_flip, _c_flip],
+                y=[_yranges[_r][0], _yranges[_r][1]],
+                mode='lines',
+                name='Flip',
+                line=dict(color='#A855F7', dash='dot', width=2),
+                opacity=0.9,
+                showlegend=(_r == 1),
+                legendgroup='flip',
+                hoverinfo='name+x',
+            ), row=_r, col=1)
         if _c_pw:
-            _fig.add_vline(
-                x=_c_pw, line_dash="dashdot",
-                line_color="#22C55E",
-                line_width=1.5, opacity=0.7,
-                row=_r, col=1,
-                annotation_text=(
-                    "+Wall" if _r == 1 else None
+            _fig.add_trace(go.Scatter(
+                x=[_c_pw, _c_pw],
+                y=[_yranges[_r][0], _yranges[_r][1]],
+                mode='lines',
+                name='+Wall',
+                line=dict(
+                    color='#22C55E', dash='dashdot', width=1.5,
                 ),
-                annotation_font=dict(
-                    color="#22C55E", size=9),
-            )
+                opacity=0.7,
+                showlegend=(_r == 1),
+                legendgroup='pos_wall',
+                hoverinfo='name+x',
+            ), row=_r, col=1)
         if _c_nw:
-            _fig.add_vline(
-                x=_c_nw, line_dash="dashdot",
-                line_color="#F43F5E",
-                line_width=1.5, opacity=0.7,
-                row=_r, col=1,
-                annotation_text=(
-                    "−Wall" if _r == 1 else None
+            _fig.add_trace(go.Scatter(
+                x=[_c_nw, _c_nw],
+                y=[_yranges[_r][0], _yranges[_r][1]],
+                mode='lines',
+                name='−Wall',
+                line=dict(
+                    color='#F43F5E', dash='dashdot', width=1.5,
                 ),
-                annotation_font=dict(
-                    color="#F43F5E", size=9),
-            )
+                opacity=0.7,
+                showlegend=(_r == 1),
+                legendgroup='neg_wall',
+                hoverinfo='name+x',
+            ), row=_r, col=1)
 
     _fig.update_layout(
         barmode='group', bargap=0.15,
-        height=700,
+        height=750,
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         hovermode="x unified",
         legend=dict(
             orientation="h",
-            yanchor="bottom", y=1.03,
+            yanchor="bottom", y=1.04,
             xanchor="center", x=0.5,
+            font=dict(size=11),
+            itemclick="toggle",
+            itemdoubleclick="toggleothers",
         ),
-        margin=dict(l=10, r=10, t=40, b=10),
+        margin=dict(l=10, r=10, t=80, b=10),
     )
     _fig.update_xaxes(
         title_text="Strike Price",
@@ -529,10 +766,16 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             unsafe_allow_html=True,
         )
     with m2:
+        _flip_delta = (
+            f"mean {_mean_flip:,.1f} ({len(_all_comp_crossings)} crossings)"
+            if _mean_flip is not None else None
+        )
         st.metric(
             "🟣 Composite Flip",
-            f"{_c_flip:,.1f}"
-            if _c_flip else "N/A",
+            f"{_c_flip:,.1f}" if _c_flip else "N/A",
+            delta=_flip_delta,
+            delta_color="off",
+            help="Primary: nearest crossing to ATM  |  delta: mean of all crossings (SD center)",
         )
     with m3:
         st.metric(
@@ -607,9 +850,13 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
 
     # ── Vanna/Volga interpretation ──
     if _net_vanna != 0 and _delta_iv != 0:
+        # Positive Vanna × Positive ΔIV (gold: price↑ + IV↑) compresses the
+        # upper GTBR bound toward ATM → squeeze risk is on the UPSIDE.
+        # Negative Vanna × Positive ΔIV (equities: price↓ + IV↑) compresses
+        # the lower GTBR bound → crash acceleration on the DOWNSIDE.
         _vanna_dir = (
-            "downside" if _net_vanna * _delta_iv > 0
-            else "upside"
+            "upside" if _net_vanna * _delta_iv > 0
+            else "downside"
         )
         _vanna_msg = (
             f"**Vanna** shifts GTBR toward **{_vanna_dir}** "
@@ -645,7 +892,7 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         st.warning(
             f"🟣 **{_n_blocks} Block Trade(s) "
             f"detected** "
-            f"(Vol/OI ratio ≥ {_block_thr}x)"
+            f"(γ-Flow/GEX ratio ≥ {_block_thr}x — intraday flow ≈ structural OI)"
         )
         st.dataframe(
             _blk_detail,
@@ -812,3 +1059,166 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             hide_index=True,
             use_container_width=True,
         )
+
+    # ═════════════════════════════════════
+    #  σ-RANGE TABLE: 1–6 Standard Deviations
+    # ═════════════════════════════════════
+    if _iv_comp and _dte > 0:
+        st.markdown("---")
+        st.markdown(
+            "### :material/sigma: "
+            "σ-Range Table — 1 ถึง 6 Standard Deviations"
+        )
+
+        _center_label = (
+            f"Lowest Composite Flip {_sd_center:,.1f}"
+            if _all_comp_crossings else f"ATM {_atm:,.1f} (no crossings)"
+        )
+
+        st.caption(
+            f"**ศูนย์กลาง (Center):** {_center_label}  ·  "
+            f"σ_daily = F×σ/√365 = ±{_sigma_d:.1f}  ·  "
+            f"σ_expiry = F×σ×√T = ±{_sigma_e:.1f}  ·  "
+            f"IV = {_iv_comp * 100:.2f}%  ·  DTE = {_dte:.2f}  ·  "
+            f"⚠ ตลาดจริงมี Fat Tail — 3σ+ เกิดบ่อยกว่า Normal Distribution"
+        )
+
+        _sd_probs   = [68.27, 95.45, 99.73, 99.994, 99.99994, 99.9999998]
+        _sd_notes   = [
+            "Gamma Scalping Zone — เคลื่อนไหวปกติ",
+            "Stop-loss Reference — ระดับ Outlier",
+            "Rare Event — Black Swan เริ่มต้น",
+            "Extreme Tail Risk — หายากมาก",
+            "Near-Impossible (Normal) — ⚠ Fat Tail ทำให้เกิดได้",
+            "Fat-Tail Warning ⚠ ตลาดจริงเกินบ่อยกว่านี้มาก",
+        ]
+        _sd_rows = []
+        for _n, _prob, _note in zip(range(1, 7), _sd_probs, _sd_notes):
+            _sd_rows.append({
+                "σ": f"{_n}σ",
+                "Normal %": f"{_prob:.5f}",
+                "Daily Lo": round(_sd_center - _n * _sigma_d, 1),
+                "Daily Hi": round(_sd_center + _n * _sigma_d, 1),
+                "Daily Width": round(2 * _n * _sigma_d, 1),
+                "Expiry Lo": round(_sd_center - _n * _sigma_e, 1),
+                "Expiry Hi": round(_sd_center + _n * _sigma_e, 1),
+                "Expiry Width": round(2 * _n * _sigma_e, 1),
+                "หมายเหตุ": _note,
+            })
+        _sd_df = pd.DataFrame(_sd_rows)
+
+        st.dataframe(
+            _sd_df,
+            column_config={
+                "σ": st.column_config.TextColumn("σ", width="small"),
+                "Normal %": st.column_config.NumberColumn(
+                    "Normal %", format="%.5f%%", width="medium"),
+                "Daily Lo": st.column_config.NumberColumn(
+                    "Daily Lo", format="%,.1f"),
+                "Daily Hi": st.column_config.NumberColumn(
+                    "Daily Hi", format="%,.1f"),
+                "Daily Width": st.column_config.NumberColumn(
+                    "Daily ±Width", format="%,.1f"),
+                "Expiry Lo": st.column_config.NumberColumn(
+                    "Expiry Lo", format="%,.1f"),
+                "Expiry Hi": st.column_config.NumberColumn(
+                    "Expiry Hi", format="%,.1f"),
+                "Expiry Width": st.column_config.NumberColumn(
+                    "Expiry ±Width", format="%,.1f"),
+                "หมายเหตุ": st.column_config.TextColumn(
+                    "หมายเหตุ", width="large"),
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        # ═════════════════════════════════════
+        #  σ-RANGE TABLE: DEALER GRAVITY CENTER
+        #  Center = Vanna-Volga GTBR midpoint (F + shift_daily)
+        #  = midpoint of dealer's Theta-optimal safe zone after Vanna/Volga adjustment.
+        #  Answers: "where is price PULLED to?" (behavioral) vs the Flip-centered
+        #  table above which answers "where can price go?" (statistical probability).
+        #  Supported by Carr & Wu (2020) and institutional GEX pinning theory:
+        #  in Positive GEX regime price is magnetised toward the dealer-optimal pin;
+        #  V-GTBR midpoint is more precise than raw Max Pain because it incorporates
+        #  dynamic IV (Vanna) and vol-of-vol (Volga) into the dealer's cost centre.
+        # ═════════════════════════════════════
+        if _va_ld and _va_hd:
+            # Dealer Gravity Center: midpoint of the Vanna-Volga adjusted daily range.
+            # Equivalent to ATM + shift_daily, where shift_daily = (lo_d + hi_d)/2 - F.
+            _dgc = (_va_ld + _va_hd) / 2.0
+
+            st.markdown("---")
+            st.markdown(
+                "### :material/hub: "
+                "σ-Range Table — Dealer Gravity Center (DGC)"
+            )
+            st.caption(
+                f"**ศูนย์กลาง (DGC):** V-GTBR Midpoint = {_dgc:,.1f}  "
+                f"(ATM {_atm:,.1f} {_v_shift_d:+.1f} จาก Vanna-Volga shift)  ·  "
+                f"σ_daily = ±{_sigma_d:.1f}  ·  σ_expiry = ±{_sigma_e:.1f}  ·  "
+                f"IV = {_iv_comp * 100:.2f}%  ·  DTE = {_dte:.2f}  ·  "
+                f"📌 DGC = จุดที่ Dealer มีแรงจูงใจ Pin ราคา (Behavioral Center)  ·  "
+                f"⚠ ตลาดจริงมี Fat Tail — 3σ+ เกิดบ่อยกว่า Normal Distribution"
+            )
+
+            _dgc_notes = [
+                "Dealer Safe Zone — Theta > Gamma Loss (ปกป้องพรีเมียม)",
+                "Hedging Pressure Zone — Dealer เริ่ม Rebalance เชิงรุก",
+                "Inelastic Demand — Panic Hedge / Gamma Squeeze เริ่มต้น",
+                "Extreme Tail — Dealer ขาดทุนเกินระดับ Gamma Scalping",
+                "Near-Impossible (Normal) — ⚠ Fat Tail ทำให้เกิดได้",
+                "Fat-Tail Warning ⚠ Shadow Vega / Volga Trap — ขาดทุนแบบ Exponential",
+            ]
+            _dgc_rows = []
+            for _n, _prob, _note in zip(range(1, 7), _sd_probs, _dgc_notes):
+                _dgc_rows.append({
+                    "σ": f"{_n}σ",
+                    "Normal %": f"{_prob:.5f}",
+                    "Daily Lo": round(_dgc - _n * _sigma_d, 1),
+                    "Daily Hi": round(_dgc + _n * _sigma_d, 1),
+                    "Daily Width": round(2 * _n * _sigma_d, 1),
+                    "Expiry Lo": round(_dgc - _n * _sigma_e, 1),
+                    "Expiry Hi": round(_dgc + _n * _sigma_e, 1),
+                    "Expiry Width": round(2 * _n * _sigma_e, 1),
+                    "หมายเหตุ": _note,
+                })
+            _dgc_df = pd.DataFrame(_dgc_rows)
+
+            st.dataframe(
+                _dgc_df,
+                column_config={
+                    "σ": st.column_config.TextColumn("σ", width="small"),
+                    "Normal %": st.column_config.NumberColumn(
+                        "Normal %", format="%.5f%%", width="medium"),
+                    "Daily Lo": st.column_config.NumberColumn(
+                        "Daily Lo", format="%,.1f"),
+                    "Daily Hi": st.column_config.NumberColumn(
+                        "Daily Hi", format="%,.1f"),
+                    "Daily Width": st.column_config.NumberColumn(
+                        "Daily ±Width", format="%,.1f"),
+                    "Expiry Lo": st.column_config.NumberColumn(
+                        "Expiry Lo", format="%,.1f"),
+                    "Expiry Hi": st.column_config.NumberColumn(
+                        "Expiry Hi", format="%,.1f"),
+                    "Expiry Width": st.column_config.NumberColumn(
+                        "Expiry ±Width", format="%,.1f"),
+                    "หมายเหตุ": st.column_config.TextColumn(
+                        "หมายเหตุ", width="large"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            # Comparison callout: show the offset between DGC and ATM-based center
+            _dgc_vs_sd = _dgc - _sd_center
+            if abs(_dgc_vs_sd) > 0.5:
+                _pull_dir = "สูงกว่า" if _dgc_vs_sd > 0 else "ต่ำกว่า"
+                st.info(
+                    f"📌 **DGC vs Probability Center:** "
+                    f"Dealer Gravity Center อยู่ {_pull_dir} Lowest Flip "
+                    f"**{abs(_dgc_vs_sd):,.1f} จุด** "
+                    f"({_sd_center:,.1f} → {_dgc:,.1f})  ·  "
+                    f"Vanna-Volga shift = {_v_shift_d:+.1f}  ·  "
+                    f"ยิ่ง DGC ห่างจาก ATM มาก = แรงดึง Dealer ต่อตลาดยิ่งชัดเจน"
+                )

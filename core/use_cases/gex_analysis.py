@@ -8,6 +8,7 @@ import pandas as pd
 
 from core.domain.black76 import (
     b76_gamma,
+    b76_theta,
     b76_vanna,
     b76_volga,
     normalize_iv,
@@ -39,12 +40,22 @@ def calculate_gex_analysis(
     Sign convention (dealer perspective):
       +value → stabilising (long gamma / mean-revert tendency)
       −value → destabilising (short gamma / trending tendency)
+
+    Aggregate Greeks (net_gamma_total, net_theta_total):
+      Computed as Σ Greek_K × (Call − Put) — same directional weighting as
+      Net GEX — so that all four coefficients of the Carr & Wu (2020)
+      Vanna-Volga GTBR quadratic are at the same portfolio level:
+        a = ½ · net_gamma_total
+        b = net_vanna_total · Δσ
+        c = net_theta_total/365 + ½ · net_volga_total · (Δσ)²
     """
     T = max(dte / 365.0, 1e-6)
 
     gex_rows = []
     net_vanna_total = 0.0
     net_volga_total = 0.0
+    net_gamma_total = 0.0
+    net_theta_total = 0.0
 
     for _, row in df.iterrows():
         K     = float(row['Strike'])
@@ -55,16 +66,21 @@ def calculate_gex_analysis(
         gamma   = b76_gamma(futures_price, K, T, sigma)
         net_gex = gamma * (call - put) * (futures_price ** 2) * GEX_SCALE
 
-        # Per-strike Vanna & Volga
+        # Per-strike second-order Greeks
         vanna_k = b76_vanna(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
         volga_k = b76_volga(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
-        # Net Vanna: directional (Call − Put)
+        theta_k = b76_theta(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
+
+        # Net Greeks — directional (Call − Put) for Gamma, Vanna, Theta
         net_vanna_k = vanna_k * (call - put)
-        # Net Volga: symmetric (Call + Put)
-        net_volga_k = volga_k * (call + put)
+        net_volga_k = volga_k * (call + put)   # symmetric
+        net_gamma_k = gamma   * (call - put)   # directional, no F²×0.01 scaling
+        net_theta_k = theta_k * (call - put)   # directional
 
         net_vanna_total += net_vanna_k
         net_volga_total += net_volga_k
+        net_gamma_total += net_gamma_k
+        net_theta_total += net_theta_k
 
         gex_rows.append({
             'Strike': K,
@@ -130,6 +146,8 @@ def calculate_gex_analysis(
         peak=peak,
         net_vanna_total=net_vanna_total,
         net_volga_total=net_volga_total,
+        net_gamma_total=net_gamma_total,
+        net_theta_total=net_theta_total,
     )
 
 

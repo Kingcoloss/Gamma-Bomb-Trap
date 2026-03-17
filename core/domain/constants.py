@@ -17,8 +17,11 @@ SESSION_WINDOW_HOURS = 21
 # GEX scaling factor
 GEX_SCALE = 0.01
 
-# Block trade detection threshold (Vol/OI ratio)
-BLOCK_TRADE_THRESHOLD = 2.0
+# Block trade detection threshold (Vol/OI GEX ratio).
+# Per institutional convention: Vol/OI approaching 1:1 signals a new structural
+# opening (block trade). Threshold of 1.0 flags strikes where intraday GEX flow
+# equals or exceeds structural OI GEX — indicative of fresh commitment, not churn.
+BLOCK_TRADE_THRESHOLD = 1.0
 
 # Wall convergence tolerance (strike points)
 WALL_CONVERGENCE_TOLERANCE = 25

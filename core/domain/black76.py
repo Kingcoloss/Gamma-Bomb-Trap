@@ -107,6 +107,29 @@ def b76_theta_atm(F: float, sigma: float, T: float) -> float:
     return -F * sigma * norm_pdf(0.0) / (2.0 * math.sqrt(T))
 
 
+def b76_theta(F: float, K: float, T: float, sigma: float) -> float:
+    """
+    Black-76 Theta for arbitrary strike K (annualised, r=0).
+
+        θ(F,K,T,σ) = −F · σ · N′(d1) / (2√T)
+
+    General form of b76_theta_atm — works for any K, not just ATM.
+    When K = F (ATM), d1 ≈ 0 for short DTE and N′(d1) → N′(0),
+    reducing exactly to b76_theta_atm.
+
+    Used for aggregate net_theta_total across all strikes so that
+    the Vanna-Volga GTBR quadratic (Carr & Wu 2020) is internally
+    consistent — all coefficients (a, b, c) at the same portfolio level.
+    """
+    if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
+        return 0.0
+    try:
+        d1 = b76_d1(F, K, T, sigma)
+        return -F * sigma * norm_pdf(d1) / (2.0 * math.sqrt(T))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def b76_volga(F: float, K: float, T: float, sigma: float) -> float:
     """
     Black-76 Volga (Vomma) — ∂²V/∂σ²  =  ∂Vega/∂σ
@@ -120,12 +143,17 @@ def b76_volga(F: float, K: float, T: float, sigma: float) -> float:
 
     where Vega = F · N′(d1) · √T  (Black-76, r=0)
 
+    Sign behaviour (d1·d2 term):
+      - ATM (K≈F): d1=+½σ√T, d2=−½σ√T → d1·d2 < 0 → Volga < 0 (Vega is at its
+        peak so its slope is near-zero / slightly negative)
+      - OTM (same-sign d1,d2): d1·d2 > 0 → Volga > 0; largest in the wings
+      - Volga is NOT universally positive; it is zero at ATM and positive only OTM
+
     Practical meaning:
-      - Volga > 0 for all options (convex in vol)
-      - Largest for ATM options
-      - When IV spikes: Volga amplifies the Vega P&L non-linearly
-      - Short Vega + high Volga = exponential loss in IV spike
-        (the "Shadow Vega" from Part 4 paper)
+      - OTM options: Volga > 0 — Vega increases as IV rises ("convex in vol")
+      - ATM options: Volga ≈ 0 (minimum of Volga curve)
+      - When IV spikes: OTM Volga explodes, making short-wing positions far more
+        expensive than originally modelled ("Shadow Vega" from Part 4 paper)
     """
     if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
         return 0.0
