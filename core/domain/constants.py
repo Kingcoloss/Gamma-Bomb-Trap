@@ -9,10 +9,10 @@ SQRT_2PI = math.sqrt(2.0 * math.pi)
 TIMEZONE_BANGKOK = "Asia/Bangkok"
 
 # Session boundary hour (10:00 Bangkok)
-SESSION_START_HOUR = 10
+SESSION_START_HOUR = 7
 
 # Session window duration in hours
-SESSION_WINDOW_HOURS = 15
+SESSION_WINDOW_HOURS = 21
 
 # GEX scaling factor
 GEX_SCALE = 0.01
