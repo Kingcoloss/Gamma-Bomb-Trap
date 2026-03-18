@@ -17,7 +17,7 @@ from core.use_cases.gtbr import (
     calculate_gamma_theta_breakeven,
     calculate_vanna_adjusted_gtbr,
 )
-from core.use_cases.data_helpers import extract_atm, extract_dte
+from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
 from core.presentation.styles import get_styled_header
 from core.presentation.legend import render_line_legend
 from core.domain.constants import (
@@ -66,13 +66,17 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         st.warning("⚠ ไม่พบข้อมูลที่ตรงกัน กรุณา Refresh")
         return
 
-    # ── ATM / DTE ──
+    # ── ATM / DTE / Header Vol ──
     _h1_v = _vol_snap['Header1'].iloc[0]
     _h1_o = _oi_snap['Header1'].iloc[0]
+    _h2_v = _vol_snap['Header2'].iloc[0]
+    _h2_o = _oi_snap['Header2'].iloc[0]
     _atm_v = extract_atm(_h1_v)
     _atm_o = extract_atm(_h1_o)
     _dte_v = extract_dte(_h1_v)
     _dte_o = extract_dte(_h1_o)
+    _hvol_v = extract_header_vol(_h2_v)
+    _hvol_o = extract_header_vol(_h2_o)
 
     # v5 FIX: prefer Intraday DTE (fresher) for all Greeks
     _dte = _dte_v if _dte_v and _dte_v > 0 else _dte_o
@@ -99,8 +103,9 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
     _block_thr = BLOCK_TRADE_THRESHOLD
 
     # ── Compute both GEX layers with SAME DTE ──
-    _iv_v = get_atm_iv(_vol_snap, _atm)
-    _iv_o = get_atm_iv(_oi_snap, _atm)
+    # ATM IV: prefer official CME Header2 Vol, fallback to per-strike lookup
+    _iv_v = get_atm_iv(_vol_snap, _atm, header_vol=_hvol_v)
+    _iv_o = get_atm_iv(_oi_snap, _atm, header_vol=_hvol_o)
     _iv_comp = _iv_v if _iv_v else _iv_o
 
     _gf_v = _pw_v = _nw_v = _pk_v = None
@@ -264,13 +269,24 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         _v_shift_d = vgtbr_result.shift_daily
         _v_shift_e = vgtbr_result.shift_expiry
 
-    # ── Pre-compute sigma + DGC (shared by chart and σ-Range tables) ──
+    # ── Pre-compute sigma + DGC variants (shared by chart and σ-Range tables) ──
     # Defined here so chart can use them before the σ-Range table section.
     _sigma_d = _atm * _iv_comp / math.sqrt(365) if _iv_comp and _dte > 0 else 0.0
     _sigma_e = _atm * _iv_comp * math.sqrt(_dte / 365) if _iv_comp and _dte > 0 else 0.0
-    # DGC = midpoint of V-GTBR daily range = vertex of Carr & Wu P&L parabola
-    # = F − (Net_Vanna × ΔIV) / Net_Gamma  (only valid when V-GTBR solved successfully)
-    _dgc = (_va_ld + _va_hd) / 2.0 if _va_ld and _va_hd else None
+
+    # DGC Option 1: Wall Midpoint — structural center of gravity
+    # Midpoint of +Wall (resistance) and −Wall (support) = where dealer
+    # hedging forces are in structural equilibrium.
+    _dgc_wall = (
+        (_c_pw + _c_nw) / 2.0
+        if _c_pw is not None and _c_nw is not None
+        else None
+    )
+
+    # DGC Option 2: V-GTBR Midpoint — vertex of Carr & Wu P&L parabola
+    # = F − (Net_Vanna × ΔIV) / Net_Gamma  (behavioral pin point)
+    # Only meaningful when Δσ ≠ 0 (otherwise collapses to ATM).
+    _dgc_vgtbr = (_va_ld + _va_hd) / 2.0 if _va_ld and _va_hd else None
 
     # ── Block count ──
     _n_blocks = int(_cdf['Block'].sum())
@@ -305,18 +321,21 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
 
     with _ctrl_col1:
         _sd_opts = ["📊 Lowest Flip / ATM — Probability Center"]
-        if _dgc is not None:
-            _sd_opts.append("📌 DGC — Dealer Gravity Center (Behavioral)")
+        if _dgc_wall is not None:
+            _sd_opts.append("📌 DGC Wall — ±Wall Midpoint (Structural)")
+        if _dgc_vgtbr is not None:
+            _sd_opts.append("📌 DGC V-GTBR — P&L Vertex (Behavioral)")
         _sd_mode = st.selectbox(
-
             "📐 SD Center — จุดศูนย์กลาง",
             _sd_opts,
             key="gbt_sd_mode",
             help=(
                 "Probability Center: Lowest Composite Flip (หรือ ATM) "
                 "— บอกว่าราคา 'น่าจะ' ไปถึงไหน  |  "
-                "DGC: V-GTBR Midpoint "
-                "— บอกว่า Dealer 'พยายามจะตรึง' ราคาไว้ที่ไหน"
+                "DGC Wall: จุดกึ่งกลาง +Wall/−Wall "
+                "— จุดสมดุลโครงสร้าง Hedging  |  "
+                "DGC V-GTBR: Vertex ของ Carr & Wu P&L parabola "
+                "— จุดที่ Dealer มี Profit สูงสุด (ต้องการ Δσ ≠ 0)"
             ),
         )
 
@@ -339,9 +358,17 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             ),
         )
 
-    # Resolve σ band size from selected range
-    _use_dgc = _dgc is not None and "DGC" in _sd_mode
-    _chart_center = _dgc if _use_dgc else _sd_center
+    # Resolve center from selected SD mode
+    _use_dgc = "DGC" in _sd_mode
+    if "DGC Wall" in _sd_mode and _dgc_wall is not None:
+        _chart_center = _dgc_wall
+        _dgc_label = "DGC Wall"
+    elif "DGC V-GTBR" in _sd_mode and _dgc_vgtbr is not None:
+        _chart_center = _dgc_vgtbr
+        _dgc_label = "DGC V-GTBR"
+    else:
+        _chart_center = _sd_center
+        _dgc_label = "SD Center"
 
     if "V-GTBR Daily" in _range_mode and _va_ld and _va_hd:
         _sigma_band = (_va_hd - _va_ld) / 2.0
@@ -361,15 +388,6 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
     _band_color_2s = "rgba(139,92,246,0.06)" if not _use_dgc else "rgba(251,191,36,0.06)"
     _center_line_color = "#A855F7" if not _use_dgc else "#FBBF24"
 
-    # ═════════════════════════════════════
-    #  DATA CARD: GEX & GTBR Key Levels
-    # ═════════════════════════════════════
-    st.markdown("---")
-    st.markdown(
-        "### :material/analytics: "
-        "GEX & GTBR — Key Levels"
-    )
-
     def _card(title, value, sub="", border_color="rgba(255,255,255,0.15)"):
         return (
             f"<div style='padding:10px 14px;border-radius:8px;"
@@ -383,67 +401,6 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             f"<div style='font-size:11px;color:gray'>{sub}</div>"
             f"</div>"
         )
-
-    _dc1, _dc2, _dc3, _dc4, _dc5 = st.columns(5)
-    with _dc1:
-        st.markdown(_card(
-            "ATM",
-            f"{_atm:,.1f}",
-            (f"IV {_iv_comp*100:.1f}% · DTE {_dte:.1f}"
-             if _iv_comp else f"DTE {_dte:.1f}"),
-            "rgba(136,136,136,0.4)",
-        ), unsafe_allow_html=True)
-    with _dc2:
-        _flip_str = f"{_c_flip:,.1f}" if _c_flip else "N/A"
-        _cross_n = len(_all_comp_crossings)
-        st.markdown(_card(
-            "Composite Flip",
-            _flip_str,
-            f"{_cross_n} crossing{'s' if _cross_n != 1 else ''}",
-            "rgba(168,85,247,0.4)",
-        ), unsafe_allow_html=True)
-    with _dc3:
-        _wall_str = "—"
-        if _c_pw and _c_nw:
-            _wall_str = f"{_c_nw:,.0f} — {_c_pw:,.0f}"
-        elif _c_pw:
-            _wall_str = f"— / {_c_pw:,.0f}"
-        elif _c_nw:
-            _wall_str = f"{_c_nw:,.0f} / —"
-        st.markdown(_card(
-            "−Wall / +Wall",
-            _wall_str,
-            "Support — Resistance",
-            "rgba(34,197,94,0.3)",
-        ), unsafe_allow_html=True)
-    with _dc4:
-        if _ld and _hd:
-            st.markdown(_card(
-                "GTBR Daily",
-                f"{_ld:,.0f} — {_hd:,.0f}",
-                (f"Exp: {_le:,.0f}—{_he:,.0f}"
-                 if _le and _he else ""),
-                "rgba(251,146,60,0.3)",
-            ), unsafe_allow_html=True)
-        else:
-            st.markdown(_card(
-                "GTBR", "N/A", "",
-                "rgba(251,146,60,0.2)",
-            ), unsafe_allow_html=True)
-    with _dc5:
-        if _va_ld and _va_hd:
-            st.markdown(_card(
-                "V-GTBR Daily",
-                f"{_va_ld:,.0f} — {_va_hd:,.0f}",
-                (f"Exp: {_va_le:,.0f}—{_va_he:,.0f}"
-                 if _va_le and _va_he else ""),
-                "rgba(6,182,212,0.3)",
-            ), unsafe_allow_html=True)
-        else:
-            st.markdown(_card(
-                "V-GTBR", "N/A", "",
-                "rgba(6,182,212,0.2)",
-            ), unsafe_allow_html=True)
 
     # ═════════════════════════════════════
     #  CHART: 2-row subplot
@@ -559,7 +516,7 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 x=[_chart_center, _chart_center],
                 y=[_yranges[_r][0], _yranges[_r][1]],
                 mode='lines',
-                name="DGC" if _use_dgc else "SD Center",
+                name=_dgc_label,
                 line=dict(
                     color=_center_line_color,
                     dash="longdash", width=1.5,
@@ -734,8 +691,130 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
     # ── Legend ──
     render_line_legend()
 
+    # ── Dashboard metric badges (hoverable tooltips) ──
+    _DASH_TIPS = {
+        "Regime": {
+            "color": "#22C55E",
+            "title": "Gamma Regime — สภาวะตลาด",
+            "desc": (
+                "บอกว่าตลาดอยู่ในโหมด <b>สะกดความผันผวน</b> (Long γ = Mean-revert) "
+                "หรือ <b>เร่งความผันผวน</b> (Short γ = Trend-follow)<br><br>"
+                "• Long γ → Dealer ซื้อขาลง/ขายขาขึ้น → ราคามักดีดกลับเข้าหา ATM<br>"
+                "• Short γ → Dealer ไล่ตามราคา → ราคาเคลื่อนไหวรุนแรงและเร่งตัว"
+            ),
+        },
+        "ATM": {
+            "color": "#888888",
+            "title": "ATM / IV — จุดอ้างอิงกลาง",
+            "desc": (
+                "ราคา Futures ปัจจุบัน — จุดที่ <b>Gamma และ Theta สูงสุด</b><br>"
+                "IV คือความคาดหวังของตลาดต่อความผันผวน ใช้คำนวณทุก Greek และกรอบ GTBR"
+            ),
+        },
+        "Flip": {
+            "color": "#A855F7",
+            "title": "Composite Flip — จุดเปลี่ยนระบอบ",
+            "desc": (
+                "ระดับราคาที่ <b>Cumulative GEX เปลี่ยนจากบวกเป็นลบ</b><br>"
+                "เป็น Inflection Point — พฤติกรรมราคาเปลี่ยนจากสงบเป็นรุนแรงทันที<br><br>"
+                "• เหนือ Flip → Dealer Long γ → ตลาดสงบ<br>"
+                "• ต่ำกว่า Flip → Dealer Short γ → ตลาดรุนแรง"
+            ),
+        },
+        "±Wall": {
+            "color": "#22C55E",
+            "title": "±GEX Wall — แนวรับ/แนวต้านเชิงโครงสร้าง",
+            "desc": (
+                "Strike ที่ OI หนาแน่นที่สุด — Dealer จะ <b>Rebalance อย่างรุนแรง</b> "
+                "เพื่อตรึงราคา (Pinning Effect)<br><br>"
+                "• <b>+Wall</b> = แนวต้าน (Dealer ขาย Futures เข้าใกล้)<br>"
+                "• <b>−Wall</b> = แนวรับ (หลุด → Cascading Sell-off)"
+            ),
+        },
+        "GTBR": {
+            "color": "#FB923C",
+            "title": "GTBR — กรอบจุดคุ้มทุน γ/θ",
+            "desc": (
+                "กรอบที่ <b>Theta profit = Gamma Loss</b><br>"
+                "หากราคาทะลุกรอบนี้ = Dealer ต้องไล่ Hedge ทันที (Inelastic Demand)<br><br>"
+                "• Daily: ΔF = F×σ/√365 — จุดคุ้มทุนรายวัน<br>"
+                "• Expiry: ΔF = F×σ×√T — จุดคุ้มทุนตลอดอายุสัญญา"
+            ),
+        },
+        "V-GTBR": {
+            "color": "#06B6D4",
+            "title": "V-GTBR — กรอบปรับด้วย Vanna/Volga",
+            "desc": (
+                "กรอบจาก Carr & Wu (2020) ที่รวม <b>Shadow Greeks</b> เข้าไปด้วย<br>"
+                "สะท้อน Kill Zone ที่แม่นยำกว่า GTBR ปกติ<br><br>"
+                "• Vanna ทำให้กรอบ <b>เลื่อนไม่สมมาตร</b> ตามทิศทาง IV<br>"
+                "• Volga ทำให้กรอบ <b>ขยาย/หดสมมาตร</b> ตาม Vol-of-Vol"
+            ),
+        },
+        "Vanna": {
+            "color": "#3B82F6",
+            "title": "Net Vanna — Shadow Delta",
+            "desc": (
+                "วัดว่า <b>Delta เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน</b><br>"
+                "ในตลาดทองคำ (Positive Spot-Vol Correlation):<br><br>"
+                "• <b>บวก</b> → IV พุ่ง = แรงบีบซื้อ Futures (Gamma Squeeze ด้านบน)<br>"
+                "• <b>ลบ</b> → IV พุ่ง = แรงบีบขาย Futures (Crash Acceleration)"
+            ),
+        },
+        "Volga": {
+            "color": "#A855F7",
+            "title": "Net Volga — ความไว Vol-of-Vol",
+            "desc": (
+                "วัดว่า <b>Vega เปลี่ยนแค่ไหนเมื่อ IV เปลี่ยน</b><br><br>"
+                "• <b>บวก</b> → กรอบ BE ขยาย — Dealer ทนได้มากขึ้น<br>"
+                "• <b>ลบ</b> → กรอบ BE หด — Dealer เปราะบาง<br>"
+                "• IV ระเบิด + Short Volga = ขาดทุนแบบ Exponential (Shadow Vega Trap)"
+            ),
+        },
+        "ΔIV": {
+            "color": "#3B82F6",
+            "title": "ΔIV Proxy — การเปลี่ยนแปลง IV",
+            "desc": (
+                "ผลต่าง IV ระหว่าง <b>Intraday snapshot</b> กับ <b>OI settlement</b><br>"
+                "ใช้คำนวณแรงผลักจาก Shadow Greeks ในสมการ Carr & Wu<br><br>"
+                "• ΔIV สูง → Vanna/Volga term มีอิทธิพลมากขึ้น<br>"
+                "• Cap ±5% เพื่อป้องกัน Distortion จาก Vol Regime Jump"
+            ),
+        },
+        "DGC": {
+            "color": "#FBBF24",
+            "title": "DGC — Dealer Gravity Center",
+            "desc": (
+                "จุดศูนย์ถ่วงเชิงพฤติกรรม — <b>Operational Pin Point</b><br>"
+                "จุดที่ Dealer มีแรงจูงใจทางการเงินสูงสุดในการตรึงราคา "
+                "เพื่อให้ Theta profit ชนะ Gamma + Shadow Greeks loss<br><br>"
+                "• <b>Wall Mid</b>: จุดกลาง +Wall/−Wall — สมดุลโครงสร้าง<br>"
+                "• <b>V-GTBR</b>: Vertex ของ P&L parabola — สมดุลพฤติกรรม"
+            ),
+        },
+    }
+    _tip_badges = ""
+    for _tk, _tv in _DASH_TIPS.items():
+        _tc = _tv["color"]
+        _tip_badges += (
+            f'<div class="vl-item" style="border-color:{_tc}">'
+            f'  <span class="vl-dot" style="background:{_tc}"></span>'
+            f'  <span style="color:{_tc}">{_tk}</span>'
+            f'  <div class="vl-tip">'
+            f'    <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:6px">'
+            f'      {_tv["title"]}'
+            f'    </div>'
+            f'    {_tv["desc"]}'
+            f'  </div>'
+            f'</div>'
+        )
+    st.markdown(
+        f'<div class="vl-legend">{_tip_badges}</div>',
+        unsafe_allow_html=True,
+    )
+
     # ═════════════════════════════════════
-    #  METRICS DASHBOARD
+    #  GBT REGIME DASHBOARD (unified cards)
     # ═════════════════════════════════════
     st.markdown("---")
     st.markdown(
@@ -743,79 +822,120 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         "GBT Regime Dashboard"
     )
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    with m1:
-        _rcol = (
-            "green" if _net >= 0 else "red"
-        )
+    # ── Row 1: Regime · ATM · Flip · ±Walls · GTBR ──
+    _r1c1, _r1c2, _r1c3, _r1c4, _r1c5 = st.columns(5)
+    with _r1c1:
+        _rcol = "green" if _net >= 0 else "red"
         _rbg = (
-            'rgba(34,197,94,0.15)'
-            if _net >= 0
+            'rgba(34,197,94,0.15)' if _net >= 0
             else 'rgba(239,68,68,0.15)'
         )
         st.markdown(
-            f"<div style='text-align:center;"
-            f"padding:8px;border-radius:8px;"
-            f"background:{_rbg};"
-            f"border:1px solid {_rcol}'>"
-            f"<b style='color:{_rcol};"
-            f"font-size:14px'>{_regime}</b>"
-            f"<br><span style='font-size:12px;"
-            f"color:gray'>"
-            f"Net: {_net:,.1f}</span></div>",
+            f"<div style='padding:10px 14px;border-radius:8px;"
+            f"background:{_rbg};border:1px solid {_rcol};"
+            f"text-align:center;min-height:90px'>"
+            f"<div style='font-size:11px;color:gray;font-weight:600;"
+            f"text-transform:uppercase;letter-spacing:0.5px'>Gamma Regime</div>"
+            f"<div style='font-size:16px;font-weight:700;color:{_rcol};"
+            f"margin:4px 0 2px'>{_regime}</div>"
+            f"<div style='font-size:11px;color:gray'>Net: {_net:,.1f}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
-    with m2:
-        _flip_delta = (
-            f"mean {_mean_flip:,.1f} ({len(_all_comp_crossings)} crossings)"
-            if _mean_flip is not None else None
-        )
-        st.metric(
-            "🟣 Composite Flip",
-            f"{_c_flip:,.1f}" if _c_flip else "N/A",
-            delta=_flip_delta,
-            delta_color="off",
-            help="Primary: nearest crossing to ATM  |  delta: mean of all crossings (SD center)",
-        )
-    with m3:
-        st.metric(
-            "🟢 +Wall",
-            f"{_c_pw:,.0f}"
-            if _c_pw else "—",
-        )
-    with m4:
-        st.metric(
-            "🔴 −Wall",
-            f"{_c_nw:,.0f}"
-            if _c_nw else "—",
-        )
-    with m5:
-        if _le and _he:
-            st.metric(
-                "🟠 GTBR Expiry",
-                f"{_le:,.0f}–{_he:,.0f}",
-            )
-        elif _ld and _hd:
-            st.metric(
-                "🟡 GTBR Daily",
-                f"{_ld:,.0f}–{_hd:,.0f}",
-            )
+    with _r1c2:
+        st.markdown(_card(
+            "ATM",
+            f"{_atm:,.1f}",
+            (f"IV {_iv_comp*100:.1f}% · DTE {_dte:.1f}"
+             if _iv_comp else f"DTE {_dte:.1f}"),
+            "rgba(136,136,136,0.4)",
+        ), unsafe_allow_html=True)
+    with _r1c3:
+        _flip_str = f"{_c_flip:,.1f}" if _c_flip else "N/A"
+        _cross_n = len(_all_comp_crossings)
+        _flip_sub = f"{_cross_n} crossing{'s' if _cross_n != 1 else ''}"
+        if _mean_flip is not None:
+            _flip_sub += f" · mean {_mean_flip:,.1f}"
+        st.markdown(_card(
+            "Composite Flip",
+            _flip_str,
+            _flip_sub,
+            "rgba(168,85,247,0.4)",
+        ), unsafe_allow_html=True)
+    with _r1c4:
+        _wall_str = "—"
+        if _c_pw and _c_nw:
+            _wall_str = f"{_c_nw:,.0f} — {_c_pw:,.0f}"
+        elif _c_pw:
+            _wall_str = f"— / {_c_pw:,.0f}"
+        elif _c_nw:
+            _wall_str = f"{_c_nw:,.0f} / —"
+        st.markdown(_card(
+            "−Wall / +Wall",
+            _wall_str,
+            "Support — Resistance",
+            "rgba(34,197,94,0.3)",
+        ), unsafe_allow_html=True)
+    with _r1c5:
+        if _ld and _hd:
+            _gtbr_sub = f"Exp: {_le:,.0f}—{_he:,.0f}" if _le and _he else ""
+            st.markdown(_card(
+                "GTBR Daily",
+                f"{_ld:,.0f} — {_hd:,.0f}",
+                _gtbr_sub,
+                "rgba(251,146,60,0.3)",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(_card(
+                "GTBR", "N/A", "",
+                "rgba(251,146,60,0.2)",
+            ), unsafe_allow_html=True)
 
-    # ── Vanna/Volga metrics row ──
-    v1, v2, v3, v4, v5 = st.columns(5)
-    with v1:
-        st.metric(
-            "🔷 Net Vanna",
+    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+
+    # ── Row 2: V-GTBR · Net Vanna · Net Volga · ΔIV · DGC ──
+    _r2c1, _r2c2, _r2c3, _r2c4, _r2c5 = st.columns(5)
+    with _r2c1:
+        if _va_ld and _va_hd:
+            _vgtbr_sub = f"Exp: {_va_le:,.0f}—{_va_he:,.0f}" if _va_le and _va_he else ""
+            if _v_shift_d != 0:
+                _vgtbr_sub += f" · shift {_v_shift_d:+.1f}"
+            st.markdown(_card(
+                "V-GTBR Daily",
+                f"{_va_ld:,.0f} — {_va_hd:,.0f}",
+                _vgtbr_sub,
+                "rgba(6,182,212,0.3)",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(_card(
+                "V-GTBR", "N/A", "",
+                "rgba(6,182,212,0.2)",
+            ), unsafe_allow_html=True)
+    with _r2c2:
+        _vanna_dir_label = (
+            "Bullish Shift" if _net_vanna > 0
+            else "Bearish Shift" if _net_vanna < 0
+            else "Neutral"
+        )
+        st.markdown(_card(
+            "Net Vanna",
             f"{_net_vanna:,.2f}",
-            help="Σ Vanna × (Call−Put) OI — asymmetric shift",
+            _vanna_dir_label,
+            "rgba(59,130,246,0.3)",
+        ), unsafe_allow_html=True)
+    with _r2c3:
+        _volga_label = (
+            "Widen Range" if _net_volga > 0
+            else "Narrow Range" if _net_volga < 0
+            else "Neutral"
         )
-    with v2:
-        st.metric(
-            "🔶 Net Volga",
+        st.markdown(_card(
+            "Net Volga",
             f"{_net_volga:,.2f}",
-            help="Σ Volga × (Call+Put) OI — symmetric widening",
-        )
-    with v3:
+            _volga_label,
+            "rgba(168,85,247,0.3)",
+        ), unsafe_allow_html=True)
+    with _r2c4:
         _was_capped = (
             bool(_iv_v and _iv_o)
             and abs(_iv_v - _iv_o) > DELTA_IV_CAP
@@ -824,36 +944,33 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             f"{_delta_iv*100:+.2f}%"
             + (" (capped)" if _was_capped else "")
             if _delta_iv != 0
-            else "0 (no IV diff)"
+            else "0"
         )
-        st.metric(
-            "🔷 ΔIV proxy",
+        st.markdown(_card(
+            "ΔIV Proxy",
             _div_str,
-            help="IV_intraday − IV_OI as proxy for expected IV move (capped at ±5%)",
-        )
-    with v4:
-        if _va_ld and _va_hd:
-            st.metric(
-                "🔹 V-GTBR Daily",
-                f"{_va_ld:,.0f}–{_va_hd:,.0f}",
-                delta=f"shift {_v_shift_d:+.1f}" if _v_shift_d != 0 else None,
-                delta_color="inverse",
-            )
-    with v5:
-        if _va_le and _va_he:
-            st.metric(
-                "🔹 V-GTBR Expiry",
-                f"{_va_le:,.0f}–{_va_he:,.0f}",
-                delta=f"shift {_v_shift_e:+.1f}" if _v_shift_e != 0 else None,
-                delta_color="inverse",
-            )
+            "IV_intraday − IV_OI",
+            "rgba(59,130,246,0.2)",
+        ), unsafe_allow_html=True)
+    with _r2c5:
+        _dgc_display = _dgc_wall if _dgc_wall is not None else _dgc_vgtbr
+        if _dgc_display is not None:
+            _dgc_offset = _dgc_display - _atm
+            _dgc_type = "Wall Mid" if _dgc_wall is not None else "V-GTBR"
+            st.markdown(_card(
+                f"DGC ({_dgc_type})",
+                f"{_dgc_display:,.1f}",
+                f"ATM {_dgc_offset:+.1f}",
+                "rgba(251,191,36,0.3)",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(_card(
+                "DGC", "N/A", "",
+                "rgba(251,191,36,0.2)",
+            ), unsafe_allow_html=True)
 
-    # ── Vanna/Volga interpretation ──
+    # ── Vanna/Volga interpretation caption ──
     if _net_vanna != 0 and _delta_iv != 0:
-        # Positive Vanna × Positive ΔIV (gold: price↑ + IV↑) compresses the
-        # upper GTBR bound toward ATM → squeeze risk is on the UPSIDE.
-        # Negative Vanna × Positive ΔIV (equities: price↓ + IV↑) compresses
-        # the lower GTBR bound → crash acceleration on the DOWNSIDE.
         _vanna_dir = (
             "upside" if _net_vanna * _delta_iv > 0
             else "downside"
@@ -870,6 +987,8 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 f"(Volga={_net_volga:+.2f} × (Δσ)²)"
             )
         st.caption(f"🔷 **Vol Dimension:** {_vanna_msg}")
+
+    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
 
     # ── Convergence info ──
     if _conv:
@@ -1143,20 +1262,37 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         #  V-GTBR midpoint is more precise than raw Max Pain because it incorporates
         #  dynamic IV (Vanna) and vol-of-vol (Volga) into the dealer's cost centre.
         # ═════════════════════════════════════
-        if _va_ld and _va_hd:
-            # Dealer Gravity Center: midpoint of the Vanna-Volga adjusted daily range.
-            # Equivalent to ATM + shift_daily, where shift_daily = (lo_d + hi_d)/2 - F.
-            _dgc = (_va_ld + _va_hd) / 2.0
+        # ── Resolve which DGC to use for the σ-Range table ──
+        _dgc_table = None
+        _dgc_table_label = ""
+        _dgc_table_sub = ""
+        if _dgc_wall is not None:
+            _dgc_table = _dgc_wall
+            _wall_offset = _dgc_wall - _atm
+            _dgc_table_label = "DGC Wall — ±Wall Midpoint"
+            _dgc_table_sub = (
+                f"**ศูนย์กลาง (DGC Wall):** "
+                f"(+Wall {_c_pw:,.0f} + −Wall {_c_nw:,.0f}) / 2 = {_dgc_wall:,.1f}  "
+                f"(ATM {_atm:,.1f} {_wall_offset:+.1f})  ·  "
+            )
+        if _dgc_vgtbr is not None and abs(_v_shift_d) > 0.5:
+            _dgc_table = _dgc_vgtbr
+            _dgc_table_label = "DGC V-GTBR — P&L Vertex"
+            _dgc_table_sub = (
+                f"**ศูนย์กลาง (DGC V-GTBR):** "
+                f"V-GTBR Midpoint = {_dgc_vgtbr:,.1f}  "
+                f"(ATM {_atm:,.1f} {_v_shift_d:+.1f} จาก Vanna-Volga shift)  ·  "
+            )
 
+        if _dgc_table is not None:
             st.markdown("---")
             st.markdown(
-                "### :material/hub: "
-                "σ-Range Table — Dealer Gravity Center (DGC)"
+                f"### :material/hub: "
+                f"σ-Range Table — {_dgc_table_label}"
             )
             st.caption(
-                f"**ศูนย์กลาง (DGC):** V-GTBR Midpoint = {_dgc:,.1f}  "
-                f"(ATM {_atm:,.1f} {_v_shift_d:+.1f} จาก Vanna-Volga shift)  ·  "
-                f"σ_daily = ±{_sigma_d:.1f}  ·  σ_expiry = ±{_sigma_e:.1f}  ·  "
+                _dgc_table_sub
+                + f"σ_daily = ±{_sigma_d:.1f}  ·  σ_expiry = ±{_sigma_e:.1f}  ·  "
                 f"IV = {_iv_comp * 100:.2f}%  ·  DTE = {_dte:.2f}  ·  "
                 f"📌 DGC = จุดที่ Dealer มีแรงจูงใจ Pin ราคา (Behavioral Center)  ·  "
                 f"⚠ ตลาดจริงมี Fat Tail — 3σ+ เกิดบ่อยกว่า Normal Distribution"
@@ -1175,11 +1311,11 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 _dgc_rows.append({
                     "σ": f"{_n}σ",
                     "Normal %": f"{_prob:.5f}",
-                    "Daily Lo": round(_dgc - _n * _sigma_d, 1),
-                    "Daily Hi": round(_dgc + _n * _sigma_d, 1),
+                    "Daily Lo": round(_dgc_table - _n * _sigma_d, 1),
+                    "Daily Hi": round(_dgc_table + _n * _sigma_d, 1),
                     "Daily Width": round(2 * _n * _sigma_d, 1),
-                    "Expiry Lo": round(_dgc - _n * _sigma_e, 1),
-                    "Expiry Hi": round(_dgc + _n * _sigma_e, 1),
+                    "Expiry Lo": round(_dgc_table - _n * _sigma_e, 1),
+                    "Expiry Hi": round(_dgc_table + _n * _sigma_e, 1),
                     "Expiry Width": round(2 * _n * _sigma_e, 1),
                     "หมายเหตุ": _note,
                 })
@@ -1210,15 +1346,14 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 use_container_width=True,
             )
 
-            # Comparison callout: show the offset between DGC and ATM-based center
-            _dgc_vs_sd = _dgc - _sd_center
+            # Comparison callout: show the offset between DGC and probability center
+            _dgc_vs_sd = _dgc_table - _sd_center
             if abs(_dgc_vs_sd) > 0.5:
                 _pull_dir = "สูงกว่า" if _dgc_vs_sd > 0 else "ต่ำกว่า"
                 st.info(
                     f"📌 **DGC vs Probability Center:** "
                     f"Dealer Gravity Center อยู่ {_pull_dir} Lowest Flip "
                     f"**{abs(_dgc_vs_sd):,.1f} จุด** "
-                    f"({_sd_center:,.1f} → {_dgc:,.1f})  ·  "
-                    f"Vanna-Volga shift = {_v_shift_d:+.1f}  ·  "
+                    f"({_sd_center:,.1f} → {_dgc_table:,.1f})  ·  "
                     f"ยิ่ง DGC ห่างจาก ATM มาก = แรงดึง Dealer ต่อตลาดยิ่งชัดเจน"
                 )

@@ -16,7 +16,7 @@ from core.use_cases.gtbr import (
     calculate_gamma_theta_breakeven,
     calculate_vanna_adjusted_gtbr,
 )
-from core.use_cases.data_helpers import extract_atm, extract_dte
+from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
 from core.domain.constants import DELTA_IV_CAP
 from core.presentation.styles import get_styled_header
 from core.presentation.chart_helpers import (
@@ -61,10 +61,11 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFram
     net_gamma_o = net_theta_o = 0.0
     va_ld_o = va_hd_o = va_le_o = va_he_o = None
     v_shift_d_o = 0.0
-    dgc_o = None
+    dgc_wall_o = None
 
     if atm_oi and dte_oi:
-        iv_atm_o = get_atm_iv(oi_raw, atm_oi)
+        _hvol_o = extract_header_vol(h2_oi)
+        iv_atm_o = get_atm_iv(oi_raw, atm_oi, header_vol=_hvol_o)
         if iv_atm_o and dte_oi > 0:
             result = calculate_gex_analysis(
                 oi_raw, atm_oi, dte_oi, data_mode="OI"
@@ -92,7 +93,12 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFram
                     df_intraday['Time'] == st.session_state.selected_time_state
                 ].copy()
                 if not _intra_snap.empty:
-                    _iv_intra = get_atm_iv(_intra_snap, atm_oi)
+                    _hvol_intra = extract_header_vol(
+                        _intra_snap['Header2'].iloc[0]
+                    ) if 'Header2' in _intra_snap.columns else None
+                    _iv_intra = get_atm_iv(
+                        _intra_snap, atm_oi, header_vol=_hvol_intra
+                    )
                     if _iv_intra and iv_atm_o:
                         _raw_d = _iv_intra - iv_atm_o
                         _delta_iv_o = max(
@@ -110,7 +116,11 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFram
             va_le_o = vgtbr_o.lo_expiry
             va_he_o = vgtbr_o.hi_expiry
             v_shift_d_o = vgtbr_o.shift_daily
-            dgc_o = (va_ld_o + va_hd_o) / 2.0
+            dgc_wall_o = (
+                (pos_wall_o + neg_wall_o) / 2.0
+                if pos_wall_o is not None and neg_wall_o is not None
+                else None
+            )
 
     # ── Build chart ──
     fig_oi = make_subplots(specs=[[{"secondary_y": True}]])

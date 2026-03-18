@@ -41,13 +41,13 @@ def _b76_d2(F: float, K: float, T: float, sigma: float) -> float:
 
 
 def _b76_vanna(F: float, K: float, T: float, sigma: float) -> float:
-    """Black-76 Vanna = −N′(d1) · d2 / (F · σ)."""
+    """Black-76 Vanna = −N′(d1) · d2 / σ."""
     if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
         return 0.0
     try:
         d1 = _b76_d1(F, K, T, sigma)
         d2 = d1 - sigma * math.sqrt(T)
-        return -_norm_pdf(d1) * d2 / (F * sigma)
+        return -_norm_pdf(d1) * d2 / sigma
     except (ValueError, ZeroDivisionError):
         return 0.0
 
@@ -113,7 +113,7 @@ def test_vanna_atm():
     # At ATM: d1 = 0.5σ√T, d2 = -0.5σ√T
     d1 = 0.5 * sigma * math.sqrt(T)
     d2 = -0.5 * sigma * math.sqrt(T)
-    expected = -_norm_pdf(d1) * d2 / (F * sigma)
+    expected = -_norm_pdf(d1) * d2 / sigma
     check("Vanna ATM", vanna, expected)
     # d2 < 0 → -N'(d1)*d2 > 0 → Vanna should be positive at ATM
     check_sign("Vanna ATM positive", vanna, True)
@@ -127,7 +127,7 @@ def test_vanna_otm_call():
 
     d1 = _b76_d1(F, K, T, sigma)
     d2 = d1 - sigma * math.sqrt(T)
-    expected = -_norm_pdf(d1) * d2 / (F * sigma)
+    expected = -_norm_pdf(d1) * d2 / sigma
     check("Vanna OTM Call", vanna, expected)
 
 
@@ -139,7 +139,7 @@ def test_vanna_otm_put():
 
     d1 = _b76_d1(F, K, T, sigma)
     d2 = d1 - sigma * math.sqrt(T)
-    expected = -_norm_pdf(d1) * d2 / (F * sigma)
+    expected = -_norm_pdf(d1) * d2 / sigma
     check("Vanna Deep OTM Put", vanna, expected)
     # d2 > 0 for deep ITM → -N'(d1)*d2 < 0 → Vanna negative
     check_sign("Vanna negative for large F/K", vanna, False)

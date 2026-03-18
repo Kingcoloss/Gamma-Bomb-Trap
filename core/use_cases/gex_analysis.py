@@ -151,8 +151,20 @@ def calculate_gex_analysis(
     )
 
 
-def get_atm_iv(df: pd.DataFrame, futures_price: float) -> float | None:
-    """Return implied volatility (Vol Settle, decimal) at the strike nearest to the futures price."""
+def get_atm_iv(
+    df: pd.DataFrame,
+    futures_price: float,
+    header_vol: float | None = None,
+) -> float | None:
+    """
+    Return ATM implied volatility in decimal form.
+
+    Priority:
+      1. header_vol — official CME ATM Vol from Header2 ('Vol: 24.62')
+      2. Per-strike Vol Settle at the strike nearest to ATM (fallback)
+    """
+    if header_vol is not None and header_vol > 0:
+        return normalize_iv(header_vol)
     df_copy = df.copy()
     df_copy['_dist'] = (df_copy['Strike'] - futures_price).abs()
     closest = df_copy.nsmallest(1, '_dist')
