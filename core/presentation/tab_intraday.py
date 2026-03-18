@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 
 from core.use_cases.gex_analysis import calculate_gex_analysis, get_atm_iv
 from core.use_cases.gtbr import calculate_gamma_theta_breakeven
-from core.use_cases.data_helpers import extract_atm, extract_dte
+from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
 from core.presentation.styles import get_styled_header
 from core.presentation.chart_helpers import (
     add_atm_vline,
@@ -56,7 +56,8 @@ def render_intraday_tab(df_intraday: pd.DataFrame, chart_mode: str, available_ti
     net_vanna_i = net_volga_i = 0.0
 
     if atm_intra and dte_intra:
-        iv_atm_i = get_atm_iv(frame_raw, atm_intra)
+        _hvol_i = extract_header_vol(h2_intra)
+        iv_atm_i = get_atm_iv(frame_raw, atm_intra, header_vol=_hvol_i)
         if iv_atm_i and dte_intra > 0:
             result = calculate_gex_analysis(
                 frame_raw, atm_intra, dte_intra, data_mode="Intraday"

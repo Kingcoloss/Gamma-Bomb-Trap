@@ -12,8 +12,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core.use_cases.gex_analysis import calculate_gex_analysis, get_atm_iv
-from core.use_cases.gtbr import calculate_gamma_theta_breakeven
-from core.use_cases.data_helpers import extract_atm, extract_dte
+from core.use_cases.gtbr import (
+    calculate_gamma_theta_breakeven,
+    calculate_vanna_adjusted_gtbr,
+)
+from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
+from core.domain.constants import DELTA_IV_CAP
 from core.presentation.styles import get_styled_header
 from core.presentation.chart_helpers import (
     add_atm_vline,
@@ -23,7 +27,7 @@ from core.presentation.chart_helpers import (
 from core.presentation.legend import render_line_legend
 
 
-def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str):
+def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFrame | None = None):
     """Render the Open Interest tab content."""
     if df_oi.empty:
         return
@@ -54,9 +58,14 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str):
     lo_exp_o = hi_exp_o = lo_day_o = hi_day_o = None
     iv_atm_o = None
     net_vanna_o = net_volga_o = 0.0
+    net_gamma_o = net_theta_o = 0.0
+    va_ld_o = va_hd_o = va_le_o = va_he_o = None
+    v_shift_d_o = 0.0
+    dgc_wall_o = None
 
     if atm_oi and dte_oi:
-        iv_atm_o = get_atm_iv(oi_raw, atm_oi)
+        _hvol_o = extract_header_vol(h2_oi)
+        iv_atm_o = get_atm_iv(oi_raw, atm_oi, header_vol=_hvol_o)
         if iv_atm_o and dte_oi > 0:
             result = calculate_gex_analysis(
                 oi_raw, atm_oi, dte_oi, data_mode="OI"
@@ -68,12 +77,50 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str):
             gex_peak_o = result.peak
             net_vanna_o = result.net_vanna_total
             net_volga_o = result.net_volga_total
+            net_gamma_o = result.net_gamma_total
+            net_theta_o = result.net_theta_total
 
             gtbr = calculate_gamma_theta_breakeven(atm_oi, iv_atm_o, dte_oi)
             lo_exp_o = gtbr.lo_expiry
             hi_exp_o = gtbr.hi_expiry
             lo_day_o = gtbr.lo_daily
             hi_day_o = gtbr.hi_daily
+
+            # ── Vanna-Volga Adjusted GTBR + DGC ──
+            _delta_iv_o = 0.0
+            if df_intraday is not None and not df_intraday.empty:
+                _intra_snap = df_intraday[
+                    df_intraday['Time'] == st.session_state.selected_time_state
+                ].copy()
+                if not _intra_snap.empty:
+                    _hvol_intra = extract_header_vol(
+                        _intra_snap['Header2'].iloc[0]
+                    ) if 'Header2' in _intra_snap.columns else None
+                    _iv_intra = get_atm_iv(
+                        _intra_snap, atm_oi, header_vol=_hvol_intra
+                    )
+                    if _iv_intra and iv_atm_o:
+                        _raw_d = _iv_intra - iv_atm_o
+                        _delta_iv_o = max(
+                            -DELTA_IV_CAP, min(DELTA_IV_CAP, _raw_d)
+                        )
+
+            vgtbr_o = calculate_vanna_adjusted_gtbr(
+                atm_oi, iv_atm_o, dte_oi,
+                net_vanna_o, net_volga_o, _delta_iv_o,
+                net_gamma=net_gamma_o or None,
+                net_theta=net_theta_o or None,
+            )
+            va_ld_o = vgtbr_o.lo_daily
+            va_hd_o = vgtbr_o.hi_daily
+            va_le_o = vgtbr_o.lo_expiry
+            va_he_o = vgtbr_o.hi_expiry
+            v_shift_d_o = vgtbr_o.shift_daily
+            dgc_wall_o = (
+                (pos_wall_o + neg_wall_o) / 2.0
+                if pos_wall_o is not None and neg_wall_o is not None
+                else None
+            )
 
     # ── Build chart ──
     fig_oi = make_subplots(specs=[[{"secondary_y": True}]])

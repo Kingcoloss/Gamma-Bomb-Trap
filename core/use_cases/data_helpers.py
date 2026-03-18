@@ -30,6 +30,22 @@ def extract_dte(header_text: str) -> float | None:
     return None
 
 
+def extract_header_vol(header2_text: str) -> float | None:
+    """
+    Extract ATM implied volatility from CME data Header2.
+
+    Header2 format example:
+      "Put: 1234  Call: 5678  Vol: 24.62  Vol Chg: -0.50  ..."
+
+    The 'Vol:' value is the official CME ATM Vol Settle (percentage).
+    Uses negative lookbehind to avoid matching 'Vol Chg:'.
+    """
+    match = re.search(r'(?<!Chg)\bVol:\s*([\d\.]+)', str(header2_text))
+    if match:
+        return float(match.group(1))
+    return None
+
+
 def get_session_date(now: pd.Timestamp | None = None) -> 'datetime.date':
     """
     Compute the current session date in Bangkok timezone.
