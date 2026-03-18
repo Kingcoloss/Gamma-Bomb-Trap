@@ -325,6 +325,9 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             _sd_opts.append("📌 DGC Wall — ±Wall Midpoint (Structural)")
         if _dgc_vgtbr is not None:
             _sd_opts.append("📌 DGC V-GTBR — P&L Vertex (Behavioral)")
+        # Reset stale selection when options change after data refresh
+        if st.session_state.get("gbt_sd_mode") not in _sd_opts:
+            st.session_state["gbt_sd_mode"] = _sd_opts[0]
         _sd_mode = st.selectbox(
             "📐 SD Center — จุดศูนย์กลาง",
             _sd_opts,
@@ -347,6 +350,9 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         _range_opts.append("📏 GTBR Expiry  (F×σ×√T)")
         if _va_le and _va_he:
             _range_opts.append("🔹 V-GTBR Expiry  (Vanna-Volga adj.)")
+        # Reset stale selection when options change after data refresh
+        if st.session_state.get("gbt_range_mode") not in _range_opts:
+            st.session_state["gbt_range_mode"] = _range_opts[0]
         _range_mode = st.selectbox(
             "📏 SD Range — ขนาด 1σ",
             _range_opts,
