@@ -38,3 +38,14 @@ AUTO_REFRESH_INTERVAL = 60.0
 
 # Animation frame delay (seconds)
 ANIMATION_FRAME_DELAY = 0.6
+
+# ── Rule of 16 / Trading-Day Basis ──
+TRADING_DAYS_PER_YEAR = 252
+RULE_OF_16 = 15.8745  # math.sqrt(252) — pre-computed
+CALENDAR_DAYS_PER_YEAR = 365
+
+# σ-Zone thresholds for PropFirm strategy
+SIGMA_ENTRY = 2       # PropFirm entry trigger
+SIGMA_TP = 3          # PropFirm take-profit
+SIGMA_SL = 1          # PropFirm stop-loss
+MAX_SIGMA_DISPLAY = 5  # Maximum σ levels shown in SD tables

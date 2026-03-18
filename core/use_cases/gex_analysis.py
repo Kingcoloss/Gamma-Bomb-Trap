@@ -11,6 +11,8 @@ from core.domain.black76 import (
     b76_theta,
     b76_vanna,
     b76_volga,
+    b76_speed,
+    b76_snap,
     normalize_iv,
 )
 from core.domain.models import GexResult
@@ -56,6 +58,11 @@ def calculate_gex_analysis(
     net_volga_total = 0.0
     net_gamma_total = 0.0
     net_theta_total = 0.0
+    # Symmetric PnL aggregation (Section 11) — Σ Greek × (Call+Put)
+    net_gamma_sym_total = 0.0
+    net_theta_sym_total = 0.0
+    net_speed_sym_total = 0.0
+    net_snap_sym_total = 0.0
 
     for _, row in df.iterrows():
         K     = float(row['Strike'])
@@ -71,6 +78,10 @@ def calculate_gex_analysis(
         volga_k = b76_volga(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
         theta_k = b76_theta(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
 
+        # Per-strike higher-order Greeks
+        speed_k = b76_speed(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
+        snap_k = b76_snap(futures_price, K, T, sigma) if sigma > 0.001 else 0.0
+
         # Net Greeks — directional (Call − Put) for Gamma, Vanna, Theta
         net_vanna_k = vanna_k * (call - put)
         net_volga_k = volga_k * (call + put)   # symmetric
@@ -81,6 +92,12 @@ def calculate_gex_analysis(
         net_volga_total += net_volga_k
         net_gamma_total += net_gamma_k
         net_theta_total += net_theta_k
+
+        # Symmetric PnL aggregation (Section 11) — separate from GEX system
+        net_gamma_sym_total += gamma * (call + put)
+        net_theta_sym_total += theta_k * (call + put)
+        net_speed_sym_total += speed_k * (call + put)
+        net_snap_sym_total += snap_k * (call + put)
 
         gex_rows.append({
             'Strike': K,
@@ -148,6 +165,10 @@ def calculate_gex_analysis(
         net_volga_total=net_volga_total,
         net_gamma_total=net_gamma_total,
         net_theta_total=net_theta_total,
+        net_gamma_sym=net_gamma_sym_total,
+        net_theta_sym=net_theta_sym_total,
+        net_speed_sym=net_speed_sym_total,
+        net_snap_sym=net_snap_sym_total,
     )
 
 

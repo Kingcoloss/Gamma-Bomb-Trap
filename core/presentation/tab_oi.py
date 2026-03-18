@@ -15,6 +15,7 @@ from core.use_cases.gex_analysis import calculate_gex_analysis, get_atm_iv
 from core.use_cases.gtbr import (
     calculate_gamma_theta_breakeven,
     calculate_vanna_adjusted_gtbr,
+    calculate_gtbr_rule16,
 )
 from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
 from core.domain.constants import DELTA_IV_CAP
@@ -27,7 +28,12 @@ from core.presentation.chart_helpers import (
 from core.presentation.legend import render_line_legend
 
 
-def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFrame | None = None):
+def render_oi_tab(
+    df_oi: pd.DataFrame,
+    chart_mode: str,
+    df_intraday: pd.DataFrame | None = None,
+    pnl_view: str = "PropFirm Trader",
+):
     """Render the Open Interest tab content."""
     if df_oi.empty:
         return
@@ -162,6 +168,52 @@ def render_oi_tab(df_oi: pd.DataFrame, chart_mode: str, df_intraday: pd.DataFram
         ),
         secondary_y=True,
     )
+
+    # ── σ-Zone overlay (Rule of 16 daily σ, centered on ATM) ──
+    _sigma_d_o = 0.0
+    if atm_oi and iv_atm_o:
+        _, _, _sigma_d_o = calculate_gtbr_rule16(atm_oi, iv_atm_o)
+
+    if _sigma_d_o > 0:
+        if pnl_view == "PropFirm Trader":
+            _band_1s_o = "rgba(34,197,94,0.12)"     # Green — Safe/SL
+            _band_2s_o = "rgba(251,191,36,0.10)"     # Yellow — Entry
+        else:
+            _band_1s_o = "rgba(139,92,246,0.14)"
+            _band_2s_o = "rgba(139,92,246,0.06)"
+        fig_oi.add_vrect(
+            x0=atm_oi - 2 * _sigma_d_o,
+            x1=atm_oi + 2 * _sigma_d_o,
+            fillcolor=_band_2s_o, line_width=0, layer="below",
+            annotation_text="2σ (R16)",
+            annotation_position="top left",
+            annotation_font=dict(color="#A855F7", size=8),
+        )
+        fig_oi.add_vrect(
+            x0=atm_oi - _sigma_d_o,
+            x1=atm_oi + _sigma_d_o,
+            fillcolor=_band_1s_o, line_width=0, layer="below",
+            annotation_text="1σ (R16)",
+            annotation_position="top left",
+            annotation_font=dict(color="#A855F7", size=8),
+        )
+        # PropFirm 3σ–5σ extended zones
+        if pnl_view == "PropFirm Trader":
+            _ZONE_COLORS_O = {
+                3: "rgba(239,68,68,0.10)",
+                4: "rgba(139,92,246,0.06)",
+                5: "rgba(139,92,246,0.03)",
+            }
+            for _n in range(3, 6):
+                fig_oi.add_vrect(
+                    x0=atm_oi - _n * _sigma_d_o,
+                    x1=atm_oi + _n * _sigma_d_o,
+                    fillcolor=_ZONE_COLORS_O.get(_n, "rgba(128,128,128,0.03)"),
+                    line_width=0, layer="below",
+                    annotation_text=f"{_n}σ" if _n == 3 else None,
+                    annotation_position="top left",
+                    annotation_font=dict(color="#EF4444", size=8),
+                )
 
     # ── Vertical lines ──
     if atm_oi:

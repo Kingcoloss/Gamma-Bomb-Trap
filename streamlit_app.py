@@ -114,6 +114,21 @@ with col_refresh:
 
 
 # ══════════════════════════════════════
+# PnL View Selector (Sidebar)
+# ══════════════════════════════════════
+_pnl_views = ["PropFirm Trader", "Dealer", "Market Maker", "Hedge Fund"]
+if "pnl_view" not in st.session_state:
+    st.session_state.pnl_view = _pnl_views[0]
+
+pnl_view = st.sidebar.selectbox(
+    "📊 PnL View",
+    _pnl_views,
+    index=_pnl_views.index(st.session_state.pnl_view),
+    key="pnl_view_selector",
+)
+st.session_state.pnl_view = pnl_view
+
+# ══════════════════════════════════════
 # Main Content — Tabs
 # ══════════════════════════════════════
 print(f"intraday data rows: {len(df_intraday)}, OI data rows: {len(df_oi)}")
@@ -139,15 +154,15 @@ if not df_intraday.empty:
 
     # ── Tab 1 — GBT Composite Analysis ──
     with tab1:
-        render_gbt_tab(df_intraday, df_oi, chart_mode)
+        render_gbt_tab(df_intraday, df_oi, chart_mode, pnl_view)
 
     # ── Tab 2 — Intraday Volume ──
     with tab2:
-        render_intraday_tab(df_intraday, chart_mode, available_times)
+        render_intraday_tab(df_intraday, chart_mode, available_times, pnl_view)
 
     # ── Tab 3 — Open Interest ──
     with tab3:
-        render_oi_tab(df_oi, chart_mode)
+        render_oi_tab(df_oi, chart_mode, pnl_view=pnl_view)
 
     # ── Tab 4 — Guide ──
     with tab4:

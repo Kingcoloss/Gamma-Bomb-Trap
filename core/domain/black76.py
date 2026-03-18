@@ -164,3 +164,49 @@ def b76_volga(F: float, K: float, T: float, sigma: float) -> float:
         return vega * d1 * d2 / sigma
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def b76_speed(F: float, K: float, T: float, sigma: float) -> float:
+    """
+    Black-76 Speed — dΓ/dF (3rd derivative of option price w.r.t. F).
+
+        Speed = −Γ/F · [1 + d₁/(σ√T)]
+
+    Measures how Gamma itself changes as the underlying moves.
+    Used in quartic PnL Taylor expansion (⅙·Speed·δF³ term).
+    """
+    if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
+        return 0.0
+    try:
+        sigma = normalize_iv(sigma)
+        d1 = b76_d1(F, K, T, sigma)
+        gamma = b76_gamma(F, K, T, sigma)
+        sqrt_T = math.sqrt(T)
+        return -gamma / F * (1.0 + d1 / (sigma * sqrt_T))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def b76_snap(F: float, K: float, T: float, sigma: float) -> float:
+    """
+    Black-76 Snap — d(Speed)/dF (4th derivative of option price w.r.t. F).
+
+        Snap = Γ/F² · [(d₁² − 1)/(σ²T) + 3·d₁/(F·σ√T) + 2/F²]
+
+    Highest-order Greek in the quartic PnL expansion (1/24·Snap·δF⁴ term).
+    """
+    if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
+        return 0.0
+    try:
+        sigma = normalize_iv(sigma)
+        d1 = b76_d1(F, K, T, sigma)
+        gamma = b76_gamma(F, K, T, sigma)
+        sqrt_T = math.sqrt(T)
+        sig_sqrtT = sigma * sqrt_T
+
+        term1 = (d1 * d1 - 1.0) / (sigma * sigma * T)
+        term2 = 3.0 * d1 / (F * sig_sqrtT)
+        term3 = 2.0 / (F * F)
+        return gamma / (F * F) * (term1 + term2 + term3)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
