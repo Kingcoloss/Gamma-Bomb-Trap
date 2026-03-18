@@ -24,10 +24,23 @@ from core.domain.constants import (
     BLOCK_TRADE_THRESHOLD,
     WALL_CONVERGENCE_TOLERANCE,
     DELTA_IV_CAP,
+    SIGMA_ENTRY,
+    SIGMA_TP,
+    SIGMA_SL,
+    TRADING_DAYS_PER_YEAR,
 )
+from core.use_cases.gtbr import calculate_gtbr_rule16
+from core.use_cases.sd_range import calculate_sd_ranges
+from core.domain.vol_surface import fit_vol_surface
+from core.use_cases.dgc import calculate_polynomial_dgc
 
 
-def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: str):
+def render_gbt_tab(
+    df_intraday: pd.DataFrame,
+    df_oi: pd.DataFrame,
+    chart_mode: str,
+    pnl_view: str = "PropFirm Trader",
+):
     """
     Render the GBT Composite Analysis tab.
 
@@ -210,7 +223,10 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         sum(_all_comp_crossings) / len(_all_comp_crossings)
         if len(_all_comp_crossings) > 1 else None
     )
-    _sd_center = min(_all_comp_crossings) if _all_comp_crossings else _atm
+    _sd_center = (
+        min(_all_comp_crossings, key=lambda x: abs(x - _atm))
+        if _all_comp_crossings else _atm
+    )
 
     # ── Composite Walls ──
     _c_pw = (
@@ -271,8 +287,8 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
 
     # ── Pre-compute sigma + DGC variants (shared by chart and σ-Range tables) ──
     # Defined here so chart can use them before the σ-Range table section.
-    _sigma_d = _atm * _iv_comp / math.sqrt(365) if _iv_comp and _dte > 0 else 0.0
-    _sigma_e = _atm * _iv_comp * math.sqrt(_dte / 365) if _iv_comp and _dte > 0 else 0.0
+    _sigma_d = _atm * _iv_comp / math.sqrt(TRADING_DAYS_PER_YEAR) if _iv_comp and _dte > 0 else 0.0
+    _sigma_e = _atm * _iv_comp * math.sqrt(_dte / TRADING_DAYS_PER_YEAR) if _iv_comp and _dte > 0 else 0.0
 
     # DGC Option 1: Wall Midpoint — structural center of gravity
     # Midpoint of +Wall (resistance) and −Wall (support) = where dealer
@@ -316,45 +332,91 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 f"OI {_nw_o:.0f} vs Vol {_nw_v:.0f}"
             )
 
+    # ── Vol Surface polynomial fit (Phase 5/8) ──
+    _poly_coeffs = None
+    if 'Vol Settle' in _oi_snap.columns and _dte > 0:
+        _T_fit = max(_dte / 365.0, 1e-6)
+        _poly_coeffs = fit_vol_surface(
+            _oi_snap['Strike'].tolist(),
+            _oi_snap['Vol Settle'].tolist(),
+            _atm, _T_fit,
+        )
+
+    # ── Polynomial DGC (Phase 6) ──
+    _dgc_poly = None
+    if _poly_coeffs is not None and _dte > 0:
+        _T_fit2 = max(_dte / 365.0, 1e-6)
+        _dgc_poly = calculate_polynomial_dgc(
+            _oi_snap['Strike'].tolist(),
+            _oi_snap['Call'].tolist(),
+            _oi_snap['Put'].tolist(),
+            _oi_snap['Vol Settle'].tolist(),
+            _atm, _T_fit2, _poly_coeffs,
+        )
+
     # ── SD Range controls (center + range type) ──
     _ctrl_col1, _ctrl_col2 = st.columns(2)
 
     with _ctrl_col1:
-        _sd_opts = ["📊 Lowest Flip / ATM — Probability Center"]
+        _sd_opts = ["📊 Nearest Flip / ATM — Probability Center"]
         if _dgc_wall is not None:
             _sd_opts.append("📌 DGC Wall — ±Wall Midpoint (Structural)")
         if _dgc_vgtbr is not None:
             _sd_opts.append("📌 DGC V-GTBR — P&L Vertex (Behavioral)")
+        if _dgc_poly is not None:
+            _sd_opts.append("📌 DGC Polynomial — Vol Surface Vertex")
+        # Preserve selection; on stale/missing, default to DGC Wall if available
+        _DGC_WALL_OPT = "📌 DGC Wall — ±Wall Midpoint (Structural)"
+        if st.session_state.get("gbt_sd_mode") not in _sd_opts:
+            st.session_state["gbt_sd_mode"] = (
+                _DGC_WALL_OPT if _DGC_WALL_OPT in _sd_opts
+                else _sd_opts[0]
+            )
         _sd_mode = st.selectbox(
             "📐 SD Center — จุดศูนย์กลาง",
             _sd_opts,
             key="gbt_sd_mode",
             help=(
-                "Probability Center: Lowest Composite Flip (หรือ ATM) "
-                "— บอกว่าราคา 'น่าจะ' ไปถึงไหน  |  "
-                "DGC Wall: จุดกึ่งกลาง +Wall/−Wall "
-                "— จุดสมดุลโครงสร้าง Hedging  |  "
-                "DGC V-GTBR: Vertex ของ Carr & Wu P&L parabola "
-                "— จุดที่ Dealer มี Profit สูงสุด (ต้องการ Δσ ≠ 0)"
+                "จุดศูนย์กลางของ σ-Zone บนกราฟ · แต่ละตัวตอบคำถามต่างกัน:\n\n"
+                "• **Nearest Flip / ATM** — จุดที่ Cumulative GEX เปลี่ยนเครื่องหมาย "
+                "(ใกล้ ATM ที่สุด) ใช้ดู Regime boundary\n"
+                "• **DGC Wall** — จุดกลาง (+Wall + −Wall) / 2 "
+                "สะท้อนสมดุลโครงสร้าง Hedging ของ Dealer\n"
+                "• **DGC V-GTBR** — Vertex ของ Carr & Wu P&L parabola "
+                "จุดที่ Dealer มี Profit สูงสุด (ต้องการ Δσ ≠ 0)\n"
+                "• **DGC Polynomial** — Numerical vertex จาก PnL(ΔF) + Vol Surface "
+                "รวม Skew dynamics ทั้งหมด (Expert)\n\n"
+                "💡 **PropFirm แนะนำ**: DGC Wall หรือ DGC V-GTBR เพราะสะท้อน "
+                "แรงดึงดูดราคาที่แท้จริงจากโครงสร้าง Dealer"
             ),
         )
 
     with _ctrl_col2:
         # Build range options dynamically — V-GTBR options only when solved
-        _range_opts = ["📏 GTBR Daily  (F×σ/√365)"]
+        _range_opts = ["📏 R16 Daily  (F×σ/√252)"]
         if _va_ld and _va_hd:
             _range_opts.append("🔹 V-GTBR Daily  (Vanna-Volga adj.)")
-        _range_opts.append("📏 GTBR Expiry  (F×σ×√T)")
+        _range_opts.append("📏 R16 Expiry  (F×σ×√(DTE/252))")
         if _va_le and _va_he:
             _range_opts.append("🔹 V-GTBR Expiry  (Vanna-Volga adj.)")
+        # Preserve selection; on stale/missing, default to R16 Expiry
+        _R16_EXPIRY_OPT = "📏 R16 Expiry  (F×σ×√(DTE/252))"
+        if st.session_state.get("gbt_range_mode") not in _range_opts:
+            st.session_state["gbt_range_mode"] = (
+                _R16_EXPIRY_OPT if _R16_EXPIRY_OPT in _range_opts
+                else _range_opts[0]
+            )
         _range_mode = st.selectbox(
             "📏 SD Range — ขนาด 1σ",
             _range_opts,
             key="gbt_range_mode",
             help=(
-                "GTBR Daily/Expiry: Black-76 symmetric sigma  |  "
-                "V-GTBR Daily/Expiry: ใช้ครึ่งหนึ่งของ Vanna-Volga Kill Zone "
-                "เป็น 1σ — สะท้อนขีดจำกัดความอดทนจริงของ Dealer"
+                "ขนาด 1σ สำหรับแถบสีบนกราฟ · เลือกตาม timeframe:\n\n"
+                "• **R16 Daily** (F×σ/√252) — Breakeven รายวัน ใช้ Rule of 16\n"
+                "• **R16 Expiry** (F×σ×√(DTE/252)) — Breakeven ตลอด DTE ที่เหลือ\n"
+                "• **V-GTBR Daily/Expiry** — ครึ่งหนึ่งของ Vanna-Volga Kill Zone "
+                "เป็น 1σ สะท้อนขีดจำกัดความอดทนจริงของ Dealer\n\n"
+                "💡 **σ-Zone สี**: 1σ = 🟢 Safe Zone · 2σ = 🟡 Pressure · 3σ = 🔴 Kill Zone"
             ),
         )
 
@@ -366,6 +428,9 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
     elif "DGC V-GTBR" in _sd_mode and _dgc_vgtbr is not None:
         _chart_center = _dgc_vgtbr
         _dgc_label = "DGC V-GTBR"
+    elif "DGC Polynomial" in _sd_mode and _dgc_poly is not None:
+        _chart_center = _dgc_poly
+        _dgc_label = "DGC Poly"
     else:
         _chart_center = _sd_center
         _dgc_label = "SD Center"
@@ -383,10 +448,38 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         _sigma_band = _sigma_d
         _range_label = "1D"
 
-    # Band colors: purple for probability, gold for DGC
-    _band_color_1s = "rgba(139,92,246,0.14)" if not _use_dgc else "rgba(251,191,36,0.14)"
-    _band_color_2s = "rgba(139,92,246,0.06)" if not _use_dgc else "rgba(251,191,36,0.06)"
-    _center_line_color = "#A855F7" if not _use_dgc else "#FBBF24"
+    # Band colors: PropFirm uses semantic colors, DGC uses gold, default uses purple
+    if pnl_view == "PropFirm Trader":
+        _band_color_1s = "rgba(34,197,94,0.12)"     # Green — Safe/SL zone
+        _band_color_2s = "rgba(251,191,36,0.10)"     # Yellow — Entry zone
+        _center_line_color = "#FBBF24" if _use_dgc else "#A855F7"
+    elif _use_dgc:
+        _band_color_1s = "rgba(251,191,36,0.14)"
+        _band_color_2s = "rgba(251,191,36,0.06)"
+        _center_line_color = "#FBBF24"
+    else:
+        _band_color_1s = "rgba(139,92,246,0.14)"
+        _band_color_2s = "rgba(139,92,246,0.06)"
+        _center_line_color = "#A855F7"
+
+    # ── PropFirm σ-zone colors (3σ–5σ extend beyond existing 1σ/2σ) ──
+    _ZONE_COLORS = {
+        3: "rgba(239,68,68,0.10)",    # Red — TP / Kill Zone
+        4: "rgba(139,92,246,0.06)",    # Purple — Extreme
+        5: "rgba(139,92,246,0.03)",    # Purple faint — Black Swan
+    }
+
+    # ── Rule of 16 SD ranges (Phase 2) ──
+    _r16_lo, _r16_hi, _r16_move = (0.0, 0.0, 0.0)
+    _sd_result = None
+    if _iv_comp and _dte > 0:
+        _r16_lo, _r16_hi, _r16_move = calculate_gtbr_rule16(_atm, _iv_comp)
+        _sd_result = calculate_sd_ranges(
+            _atm, _iv_comp, max(_dte / 365.0, 1e-6),
+            center=_chart_center,
+            center_label=_dgc_label,
+            poly_coeffs=_poly_coeffs,
+        )
 
     def _card(title, value, sub="", border_color="rgba(255,255,255,0.15)"):
         return (
@@ -511,6 +604,19 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
                 annotation_position="top left",
                 annotation_font=dict(color=_center_line_color, size=8),
             )
+            # PropFirm 3σ–5σ extended zones
+            if pnl_view == "PropFirm Trader":
+                for _n_zone in range(3, 6):
+                    _zc = _ZONE_COLORS.get(_n_zone, "rgba(128,128,128,0.03)")
+                    _fig.add_vrect(
+                        x0=_chart_center - _n_zone * _sigma_band,
+                        x1=_chart_center + _n_zone * _sigma_band,
+                        fillcolor=_zc, line_width=0, layer="below",
+                        row=_r, col=1,
+                        annotation_text=f"{_n_zone}σ" if _r == 1 and _n_zone == 3 else None,
+                        annotation_position="top left",
+                        annotation_font=dict(color="#EF4444", size=8),
+                    )
             # Center line (toggleable via legend)
             _fig.add_trace(go.Scatter(
                 x=[_chart_center, _chart_center],
@@ -737,8 +843,8 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             "desc": (
                 "กรอบที่ <b>Theta profit = Gamma Loss</b><br>"
                 "หากราคาทะลุกรอบนี้ = Dealer ต้องไล่ Hedge ทันที (Inelastic Demand)<br><br>"
-                "• Daily: ΔF = F×σ/√365 — จุดคุ้มทุนรายวัน<br>"
-                "• Expiry: ΔF = F×σ×√T — จุดคุ้มทุนตลอดอายุสัญญา"
+                "• Daily: ΔF = F×σ/√252 (Rule of 16) — จุดคุ้มทุนรายวัน<br>"
+                "• Expiry: ΔF = F×σ×√(DTE/252) — จุดคุ้มทุนตลอดอายุสัญญา"
             ),
         },
         "V-GTBR": {
@@ -997,7 +1103,7 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             + "  |  ".join(_conv)
         )
 
-    # ── Block info ──
+    # ── Block info with TP/SL per strike ──
     if _n_blocks > 0:
         _blk_detail = _cdf[_cdf['Block']][[
             'Strike', 'Call_Vol', 'Put_Vol',
@@ -1008,13 +1114,62 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             / _blk_detail['GEX_OI'].abs()
             .replace(0, np.nan)
         ).round(2)
+
+        # ── Compute TP/SL per block strike based on regime ──
+        _is_long_gamma = _net >= 0
+        _tp_long_list = []
+        _tp_short_list = []
+        _sl_list = []
+
+        if _is_long_gamma:
+            # Mean-Reversion: TP = ±Wall, SL = Composite Flip
+            _tp_l = _c_pw if _c_pw else _chart_center + 2 * _sigma_band
+            _tp_s = _c_nw if _c_nw else _chart_center - 2 * _sigma_band
+            _sl_val = _c_flip if _c_flip else _chart_center
+            for _ in range(len(_blk_detail)):
+                _tp_long_list.append(round(_tp_l, 1))
+                _tp_short_list.append(round(_tp_s, 1))
+                _sl_list.append(round(_sl_val, 1))
+        else:
+            # Trend-Following: TP = 3σ, SL = 1σ (or Flip)
+            _tp_up = _chart_center + SIGMA_TP * _sigma_band
+            _tp_dn = _chart_center - SIGMA_TP * _sigma_band
+            _sl_flip = _c_flip if _c_flip else _chart_center
+            for _ in range(len(_blk_detail)):
+                _tp_long_list.append(round(_tp_up, 1))
+                _tp_short_list.append(round(_tp_dn, 1))
+                _sl_list.append(round(_sl_flip, 1))
+
+        _blk_detail['TP Long'] = _tp_long_list
+        _blk_detail['TP Short'] = _tp_short_list
+        _blk_detail['SL'] = _sl_list
+
+        _regime_tag = "LONG γ → Mean-Reversion" if _is_long_gamma else "SHORT γ → Trend-Following"
         st.warning(
-            f"🟣 **{_n_blocks} Block Trade(s) "
-            f"detected** "
-            f"(γ-Flow/GEX ratio ≥ {_block_thr}x — intraday flow ≈ structural OI)"
+            f"🟣 **{_n_blocks} Block Trade(s) detected** "
+            f"(Ratio ≥ {_block_thr}x) — **{_regime_tag}**"
+        )
+        st.caption(
+            "**Ratio** = |γ-Flow / GEX_OI| — ค่า ≥ 1.0 = สถาบันเปิดสถานะใหม่เท่ากับ OI เดิม  ·  "
+            + (
+                "**TP** = ±Wall (จุดสมดุล Hedging) · **SL** = Flip (จุดเปลี่ยน Regime)"
+                if _is_long_gamma else
+                f"**TP** = ±{SIGMA_TP}σ (Dealer forced hedge climax) · **SL** = Flip/Center"
+            )
         )
         st.dataframe(
             _blk_detail,
+            column_config={
+                "Strike": st.column_config.NumberColumn("Strike", format="%d"),
+                "Call_Vol": st.column_config.NumberColumn("Call Vol", format="%d"),
+                "Put_Vol": st.column_config.NumberColumn("Put Vol", format="%d"),
+                "γ_Flow": st.column_config.NumberColumn("γ-Flow", format="%.2f"),
+                "GEX_OI": st.column_config.NumberColumn("GEX (OI)", format="%.2f"),
+                "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f"),
+                "TP Long": st.column_config.NumberColumn("TP Long", format="%.1f"),
+                "TP Short": st.column_config.NumberColumn("TP Short", format="%.1f"),
+                "SL": st.column_config.NumberColumn("SL", format="%.1f"),
+            },
             hide_index=True,
             use_container_width=True,
         )
@@ -1190,14 +1345,14 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
         )
 
         _center_label = (
-            f"Lowest Composite Flip {_sd_center:,.1f}"
+            f"Nearest Composite Flip {_sd_center:,.1f}"
             if _all_comp_crossings else f"ATM {_atm:,.1f} (no crossings)"
         )
 
         st.caption(
             f"**ศูนย์กลาง (Center):** {_center_label}  ·  "
-            f"σ_daily = F×σ/√365 = ±{_sigma_d:.1f}  ·  "
-            f"σ_expiry = F×σ×√T = ±{_sigma_e:.1f}  ·  "
+            f"σ_daily = F×σ/√252 = ±{_sigma_d:.1f}  ·  "
+            f"σ_expiry = F×σ×√(DTE/252) = ±{_sigma_e:.1f}  ·  "
             f"IV = {_iv_comp * 100:.2f}%  ·  DTE = {_dte:.2f}  ·  "
             f"⚠ ตลาดจริงมี Fat Tail — 3σ+ เกิดบ่อยกว่า Normal Distribution"
         )
@@ -1292,7 +1447,7 @@ def render_gbt_tab(df_intraday: pd.DataFrame, df_oi: pd.DataFrame, chart_mode: s
             )
             st.caption(
                 _dgc_table_sub
-                + f"σ_daily = ±{_sigma_d:.1f}  ·  σ_expiry = ±{_sigma_e:.1f}  ·  "
+                + f"σ_daily (R16) = ±{_sigma_d:.1f}  ·  σ_expiry (R16) = ±{_sigma_e:.1f}  ·  "
                 f"IV = {_iv_comp * 100:.2f}%  ·  DTE = {_dte:.2f}  ·  "
                 f"📌 DGC = จุดที่ Dealer มีแรงจูงใจ Pin ราคา (Behavioral Center)  ·  "
                 f"⚠ ตลาดจริงมี Fat Tail — 3σ+ เกิดบ่อยกว่า Normal Distribution"

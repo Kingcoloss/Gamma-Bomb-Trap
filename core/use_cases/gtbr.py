@@ -1,12 +1,15 @@
 """
 Gamma-Theta Breakeven Range (GTBR) Calculations
 =================================================
-Standard GTBR and Vanna-Volga Adjusted GTBR.
+Standard GTBR, Vanna-Volga Adjusted GTBR, Rule of 16, and Quartic solver.
 """
 import math
 
-from core.domain.black76 import b76_gamma, b76_theta_atm
-from core.domain.models import GtbrResult, VannaVolgaGtbrResult
+import numpy as np
+
+from core.domain.black76 import b76_gamma, b76_theta_atm, normalize_iv
+from core.domain.models import GtbrResult, VannaVolgaGtbrResult, QuarticGtbrResult
+from core.domain.constants import TRADING_DAYS_PER_YEAR
 
 
 def calculate_gamma_theta_breakeven(
@@ -143,4 +146,75 @@ def calculate_vanna_adjusted_gtbr(
         lo_daily=lo_d, hi_daily=hi_d,
         lo_expiry=lo_e, hi_expiry=hi_e,
         shift_daily=shift_d, shift_expiry=shift_e,
+    )
+
+
+def calculate_gtbr_rule16(
+    F: float,
+    atm_iv: float,
+) -> tuple[float, float, float]:
+    """
+    Rule of 16: Expected daily move on trading-day basis.
+
+    ΔF_daily = F × σ / √252  (≈ F × σ / 16)
+
+    Returns:
+        (lo, hi, daily_move)
+    """
+    sigma = normalize_iv(atm_iv)
+    daily_move = F * sigma / math.sqrt(TRADING_DAYS_PER_YEAR)
+    return (F - daily_move, F + daily_move, daily_move)
+
+
+def calculate_quartic_gtbr(
+    net_gamma: float,
+    net_speed: float,
+    net_snap: float,
+    net_theta: float,
+    net_vanna: float,
+    net_volga: float,
+    delta_iv: float,
+    F: float,
+) -> QuarticGtbrResult:
+    """
+    Quartic PnL breakeven solver (4th-order Taylor expansion).
+
+    Solves: a₄(δF)⁴ + a₃(δF)³ + a₂(δF)² + a₁(δF) + a₀ = 0
+
+    Coefficients:
+        a₄ = 1/24 · net_snap
+        a₃ = 1/6  · net_speed
+        a₂ = 1/2  · net_gamma
+        a₁ = net_vanna · Δσ
+        a₀ = net_theta/252 + 1/2 · net_volga · (Δσ)²
+
+    Uses symmetric Greeks (Call+Put aggregation) for PnL accuracy.
+    Falls back to empty result if no real roots found.
+    """
+    a4 = net_snap / 24.0
+    a3 = net_speed / 6.0
+    a2 = net_gamma / 2.0
+    a1 = net_vanna * delta_iv
+    a0 = net_theta / TRADING_DAYS_PER_YEAR + 0.5 * net_volga * delta_iv ** 2
+
+    coeffs = [a4, a3, a2, a1, a0]
+
+    # Handle degenerate case: all leading coefficients zero
+    if a4 == 0 and a3 == 0 and a2 == 0:
+        return QuarticGtbrResult(coefficients=coeffs)
+
+    roots_complex = np.roots(coeffs)
+    real_roots = sorted([r.real for r in roots_complex if abs(r.imag) < 1e-8])
+
+    if not real_roots:
+        return QuarticGtbrResult(coefficients=coeffs)
+
+    lo = min(real_roots)
+    hi = max(real_roots)
+
+    return QuarticGtbrResult(
+        roots=real_roots,
+        lo_daily=F + lo,
+        hi_daily=F + hi,
+        coefficients=coeffs,
     )

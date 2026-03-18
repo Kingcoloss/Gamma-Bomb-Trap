@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core.use_cases.gex_analysis import calculate_gex_analysis, get_atm_iv
-from core.use_cases.gtbr import calculate_gamma_theta_breakeven
+from core.use_cases.gtbr import calculate_gamma_theta_breakeven, calculate_gtbr_rule16
 from core.use_cases.data_helpers import extract_atm, extract_dte, extract_header_vol
 from core.presentation.styles import get_styled_header
 from core.presentation.chart_helpers import (
@@ -25,7 +25,12 @@ from core.presentation.chart_helpers import (
 from core.presentation.legend import render_line_legend
 
 
-def render_intraday_tab(df_intraday: pd.DataFrame, chart_mode: str, available_times):
+def render_intraday_tab(
+    df_intraday: pd.DataFrame,
+    chart_mode: str,
+    available_times,
+    pnl_view: str = "PropFirm Trader",
+):
     """Render the Intraday Volume tab content."""
     time_val   = st.session_state.selected_time_state
     frame_data = (
@@ -116,6 +121,52 @@ def render_intraday_tab(df_intraday: pd.DataFrame, chart_mode: str, available_ti
         ),
         secondary_y=True,
     )
+
+    # ── σ-Zone overlay (Rule of 16 daily σ, centered on ATM) ──
+    _sigma_d_i = 0.0
+    if atm_intra and iv_atm_i:
+        _, _, _sigma_d_i = calculate_gtbr_rule16(atm_intra, iv_atm_i)
+
+    if _sigma_d_i > 0:
+        if pnl_view == "PropFirm Trader":
+            _band_1s = "rgba(34,197,94,0.12)"      # Green — Safe/SL
+            _band_2s = "rgba(251,191,36,0.10)"      # Yellow — Entry
+        else:
+            _band_1s = "rgba(139,92,246,0.14)"
+            _band_2s = "rgba(139,92,246,0.06)"
+        fig_intra.add_vrect(
+            x0=atm_intra - 2 * _sigma_d_i,
+            x1=atm_intra + 2 * _sigma_d_i,
+            fillcolor=_band_2s, line_width=0, layer="below",
+            annotation_text="2σ (R16)",
+            annotation_position="top left",
+            annotation_font=dict(color="#A855F7", size=8),
+        )
+        fig_intra.add_vrect(
+            x0=atm_intra - _sigma_d_i,
+            x1=atm_intra + _sigma_d_i,
+            fillcolor=_band_1s, line_width=0, layer="below",
+            annotation_text="1σ (R16)",
+            annotation_position="top left",
+            annotation_font=dict(color="#A855F7", size=8),
+        )
+        # PropFirm 3σ–5σ extended zones
+        if pnl_view == "PropFirm Trader":
+            _ZONE_COLORS_I = {
+                3: "rgba(239,68,68,0.10)",
+                4: "rgba(139,92,246,0.06)",
+                5: "rgba(139,92,246,0.03)",
+            }
+            for _n in range(3, 6):
+                fig_intra.add_vrect(
+                    x0=atm_intra - _n * _sigma_d_i,
+                    x1=atm_intra + _n * _sigma_d_i,
+                    fillcolor=_ZONE_COLORS_I.get(_n, "rgba(128,128,128,0.03)"),
+                    line_width=0, layer="below",
+                    annotation_text=f"{_n}σ" if _n == 3 else None,
+                    annotation_position="top left",
+                    annotation_font=dict(color="#EF4444", size=8),
+                )
 
     # ── Vertical lines ──
     if atm_intra:

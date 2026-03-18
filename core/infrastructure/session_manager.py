@@ -31,6 +31,7 @@ class SessionManager:
     KEY_SHA_INTRA = 'sha_intra'
     KEY_SHA_OI = 'sha_oi'
     KEY_SELECTED_TIME = 'selected_time_state'
+    KEY_PNL_VIEW = 'pnl_view'
 
     def __init__(self, repo: str, token: str):
         self.repo = repo
@@ -48,6 +49,7 @@ class SessionManager:
             self.KEY_SHA_INTRA: None,
             self.KEY_SHA_OI: None,
             self.KEY_LAST_FETCH: None,
+            self.KEY_PNL_VIEW: "PropFirm Trader",
         }
         for key, default in defaults.items():
             if key not in st.session_state:
